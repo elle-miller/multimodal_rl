@@ -40,7 +40,6 @@ class ImageEncoder(nn.Module):
     def __init__(self, obs_shape, latent_dim=50, num_layers=4, num_filters=32):
         super().__init__()
 
-        print("initialising cnn with ", num_layers, "and ", latent_dim, "feature dim")
 
         self.num_layers = num_layers
         self.num_filters = num_filters
@@ -50,6 +49,8 @@ class ImageEncoder(nn.Module):
         self.channels_first = True if np.argmin(obs_shape) == 0 else False
         self.num_channels = obs_shape[0] if self.channels_first else obs_shape[-1]
         self.img_dim = obs_shape[1]
+
+        print("initialising cnn with ", num_layers, "and ", latent_dim, "feature dim", "num channels", self.num_channels, self.img_dim)
 
         # First layer: 8x8 kernel focuses on broad features for downsampling
         # Second layer: reduce features, but increase channels for more features

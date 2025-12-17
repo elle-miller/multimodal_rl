@@ -352,8 +352,6 @@ class Memory:
                         # obs_k = {pixels, prop}
                         for obs_k, v in tensor[k].items():
                             if obs_k in self.tensors:
-
-                                # print(name, obs_k, self.tensors[obs_k][self.memory_index].size(), v.size())
                                 self.tensors[obs_k][self.memory_index].copy_(
                                     v[:]
                                 )  # [:] at the end to activate LazyTensors
@@ -364,12 +362,7 @@ class Memory:
                         self.tensors[k][self.memory_index].copy_(tensor[k][:])
             else:
                 if name in self.tensors:
-                    # print(name, tensor.shape)
                     self.tensors[name][self.memory_index].copy_(tensor)
-
-    # def sample_all_sequential(self, names, mini_batches, sequence_length, augment):
-    #     size = len(self)
-    #         self.sample_all(self, names, mini_batches, sequence_length, augment)
 
     def sample_all(
         self,

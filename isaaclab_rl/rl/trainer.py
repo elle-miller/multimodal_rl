@@ -2,15 +2,17 @@ import copy
 import sys
 import torch
 import tqdm
-
+import wandb 
+import numpy as np
 from copy import deepcopy
 from isaaclab_rl.ssl.dynamics import ForwardDynamics
 from isaaclab_rl.ssl.reconstruction import Reconstruction
+import matplotlib.cm as cm
 
 SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "timesteps": 100000,  # number of timesteps to train for
     "headless": False,  # whether to use headless mode (no rendering)
-    "disable_progressbar": True,  # whether to disable the progressbar. If None, disable on non-TTY
+    "disable_progressbar": False,  # whether to disable the progressbar. If None, disable on non-TTY
     "close_environment_at_exit": False,  # whether to close the environment on normal program termination
 }
 
@@ -82,6 +84,8 @@ class Trainer:
         wandb_episode_dict = {}
         wandb_episode_dict["global_step"] = self.global_step
 
+        wandb_images = []
+
         best_return = 0
 
         # counter variable for which step we are on
@@ -143,10 +147,15 @@ class Trainer:
                 self.rl_update += 1
                 rollout = 0
 
-            states = next_states
+            states = next_states 
+            
+            # save the first eval env video frames
+            if "pixels" in next_states["policy"].keys():
+                wandb_images.append(next_states["policy"]["pixels"][:][0].unsqueeze(0))
+            
             # reset environments
             # the eval episodes get manually reset every ep_length
-            if timestep > 0 and (timestep % ep_length == 0) and self.num_eval_envs > 0:
+            if timestep == 30: #timestep > 0 and (timestep % ep_length == 0) and self.num_eval_envs > 0:
 
                 # take counter item, mean across eval envs
                 if "counters" in infos.keys():
@@ -184,6 +193,39 @@ class Trainer:
                 # write checkpoints
                 if not play:
                     self.writer.write_checkpoint(mean_eval_return, timestep=self.global_step)
+
+                # upload video to wandb
+                if len(wandb_images) > 0:
+                    # 1. Stack and clean dimensions
+                    # Assuming wandb_images is list of [1, H, W, 4] (3 RGB + 1 Depth)
+                    video_tensor = torch.stack(wandb_images).squeeze(1).cpu() # Result: [T, H, W, 4]
+
+                    # 2. Extract RGB (Channels 0, 1, 2)
+                    rgb_array = video_tensor[..., :3].numpy()
+                    if rgb_array.dtype != np.uint8:
+                        rgb_array = (rgb_array * 255).astype(np.uint8)
+                    # Transpose to [T, C, H, W]
+                    rgb_array = rgb_array.transpose(0, 3, 1, 2)
+
+                    # 3. Extract and Process Depth (Channel 3)
+                    depth_raw = video_tensor[..., 3].numpy() # Result: [T, H, W]
+
+                    # Normalize depth to 0-1 for visualization
+                    # Note: Use a fixed max depth (e.g., 5.0m) or percentile to prevent flickering
+                    d_min, d_max = depth_raw.min(), 0.5
+                    depth_norm = (depth_raw - d_min) / (d_max - d_min + 1e-6)
+
+                    # Apply a Colormap (e.g., 'viridis' or 'magma') to turn [T, H, W] into [T, H, W, 3]
+                    # This makes distance much easier for humans to see than raw grayscale
+                    depth_color = cm.viridis(depth_norm)[..., :3] # Remove alpha channel
+                    depth_color = (depth_color * 255).astype(np.uint8)
+
+                    # Transpose to [T, C, H, W]
+                    depth_color = depth_color.transpose(0, 3, 1, 2)
+
+     
+                    wandb.log({"rgb_array": wandb.Video(rgb_array, fps=4, format="mp4")}, step=self.global_step)
+                    wandb.log({"depth_array": wandb.Video(depth_color, fps=4, format="mp4")}, step=self.global_step)
 
                 self.returns_dict, self.infos_dict, self.mask, self.term_mask, self.trunc_mask = (
                     self.get_empty_return_dicts(infos)

@@ -14,9 +14,7 @@ class Encoder(nn.Module):
     def __init__(self, observation_space, action_space, env_cfg, config_dict, device):
         super().__init__()
 
-        print(config_dict)
-
-        self.method = config_dict["method"]
+        self.method = config_dict["encoder"]["method"]
         assert self.method in methods
         self.device = device
 
@@ -25,11 +23,11 @@ class Encoder(nn.Module):
 
         self.num_inputs = 0
 
-        self.hiddens = config_dict["hiddens"]
-        self.activations = config_dict["activations"]
+        self.hiddens = config_dict["encoder"]["hiddens"]
+        self.activations = config_dict["encoder"]["activations"]
 
         # standard scaler
-        if config_dict["state_preprocessor"] is not None:
+        if config_dict["encoder"]["state_preprocessor"] is not None:
             self.state_preprocessor = RunningStandardScalerDict(size=observation_space, device=device)
         else:
             self.state_preprocessor = None
@@ -37,15 +35,13 @@ class Encoder(nn.Module):
         # configure relevant preprocessing
         for k, v in observation_space.items():
 
-            if k == "pixels":
+            if k == "pixel_cfg":
                 # always use cnn for pixels
                 self.pixel_obs_dim = v.shape
-                self.img_dim = config_dict["pixels"]["img_dim"]
-                latent_img_dim = config_dict["pixels"]["latent_img_dim"]
+                self.img_dim = config_dict["observations"]["pixel_cfg"]["width"]
+                latent_img_dim = config_dict["observations"]["pixel_cfg"]["latent_img_dim"]
                 self.cnn = ImageEncoder(self.pixel_obs_dim, latent_dim=latent_img_dim, num_layers=2).to(device)
                 self.num_inputs += latent_img_dim
-                # print("***********CNN*************")
-                # print(self.cnn)
 
             # TODO: figure out prop + gt case
             elif k == "prop":
@@ -72,29 +68,9 @@ class Encoder(nn.Module):
                 elif self.method == "intermediate":
                     raise NotImplementedError
 
-        # lstm layer
-        # self.lstm = torch.nn.LSTM(self.num_inputs, self.num_inputs, num_layers=1, bias=True, batch_first=False)
+        self.num_outputs = self.hiddens[-1]
+        self.net = MLP(self.num_inputs, self.hiddens, self.activations, layernorm=config_dict["encoder"]["layernorm"]).to(device)
 
-        if self.hiddens == []:
-            self.net = nn.Sequential(nn.Identity())
-            self.num_outputs = self.num_inputs
-
-        else:
-            layernorm = config_dict["layernorm"]
-            self.num_outputs = self.hiddens[-1]
-            self.net = MLP(self.num_inputs, self.hiddens, self.activations, layernorm=layernorm).to(device)
-
-            # self.net = ResidualEncoder(
-            #     input_dim=self.num_inputs,
-            #     latent_dim=self.num_outputs,
-            # ).to(device)
-
-        # self.net.add_module("ln", torch.nn.LayerNorm(self.num_outputs).to(device))
-
-        # self.net.add_module("dropout", torch.nn.Dropout(p=0.3).to(device))
-
-        # print("*********Encoder*************")
-        # print(self.net)
 
     def get_first_layer_weight_norms(self):
 
@@ -225,100 +201,94 @@ class Encoder(nn.Module):
 
         latent_inputs = torch.tensor([]).to(self.device)
         for k in sorted(obs_dict.keys()):
-            if k == "pixels" or k == "depth":
-                # assuming a shared cnn at the moment
+            if k == "pixel_cfg" or k == "depth":
                 z = self.cnn(obs_dict[k][:])
                 latent_inputs = torch.cat((latent_inputs, z), dim=-1)
         return latent_inputs
 
 
-class AIRECEncoder(nn.Module):
-    """encoder"""
+# class AIRECEncoder(nn.Module):
+#     """encoder"""
 
-    def __init__(self, observation_space, config_dict, device):
-        super().__init__()
+#     def __init__(self, observation_space, config_dict, device):
+#         super().__init__()
 
-        print(config_dict)
+#         print(config_dict)
 
-        self.device = device
+#         self.device = device
 
-        self.observation_space = observation_space
+#         self.observation_space = observation_space
 
-        self.num_inputs = 0
+#         self.num_inputs = 0
 
-        self.hiddens = config_dict["hiddens"]
-        self.activations = config_dict["activations"]
+#         self.hiddens = config_dict["hiddens"]
+#         self.activations = config_dict["activations"]
 
-        # standard scaler
-        if config_dict["state_preprocessor"] is not None:
-            self.state_preprocessor = RunningStandardScalerDict(size=observation_space, device=device)
-        else:
-            self.state_preprocessor = None
+#         # standard scaler
+#         if config_dict["state_preprocessor"] is not None:
+#             self.state_preprocessor = RunningStandardScalerDict(size=observation_space, device=device)
+#         else:
+#             self.state_preprocessor = None
 
-        # configure relevant preprocessing
-        for k, v in observation_space.items():
+#         # configure relevant preprocessing
+#         for k, v in observation_space.items():
 
-            # TODO: figure out prop + gt case
-            if k == "prop":
-                num_prop_inputs = v.shape[0]
-                self.num_inputs += num_prop_inputs
+#             # TODO: figure out prop + gt case
+#             if k == "prop":
+#                 num_prop_inputs = v.shape[0]
+#                 self.num_inputs += num_prop_inputs
 
-            elif k == "gt":
-                num_gt_inputs = v.shape[0]
-                self.num_inputs += num_gt_inputs
+#             elif k == "gt":
+#                 num_gt_inputs = v.shape[0]
+#                 self.num_inputs += num_gt_inputs
 
-            elif k == "tactile":
-                num_tactile_inputs = v.shape[0]
-                self.num_inputs += num_tactile_inputs
+#             elif k == "tactile":
+#                 num_tactile_inputs = v.shape[0]
+#                 self.num_inputs += num_tactile_inputs
 
-        if self.hiddens == []:
-            self.net = nn.Sequential(nn.Identity())
-            self.num_outputs = self.num_inputs
+#         if self.hiddens == []:
+#             self.net = nn.Sequential(nn.Identity())
+#             self.num_outputs = self.num_inputs
 
-        else:
-            layernorm = config_dict["layernorm"]
-            self.num_outputs = self.hiddens[-1]
-            self.net = MLP(self.num_inputs, self.hiddens, self.activations, layernorm=layernorm).to(device)
+#         else:
+#             layernorm = config_dict["layernorm"]
+#             self.num_outputs = self.hiddens[-1]
+#             self.net = MLP(self.num_inputs, self.hiddens, self.activations, layernorm=layernorm).to(device)
 
-        # print("*********Encoder*************")
-        # print(self.net)
+#         # print("*********Encoder*************")
+#         # print(self.net)
 
-    def concatenate_obs(self, obs_dict):
-        # separate out components of obs dict
-        # for early , concat raw inputs with image inputs
-        raw_inputs = self.get_raw_inputs(obs_dict)
 
-        return raw_inputs
 
-    def forward(self, obs_dict, detach=False, train=False):
-        """
-        Take in an obs dict, and return z
+#     def forward(self, obs_dict, detach=False, train=False):
+#         """
+#         Take in an obs dict, and return z
 
-        """
-        # sometimes need to detach, e.g. for linear probing
-        if detach:
-            obs_dict = {key: value.detach() for key, value in obs_dict.items()}
+#         """
+#         # sometimes need to detach, e.g. for linear probing
+#         if detach:
+#             obs_dict = {key: value.detach() for key, value in obs_dict.items()}
 
-        if "policy" in obs_dict.keys():
-            obs_dict = obs_dict["policy"]
+#         if "policy" in obs_dict.keys():
+#             obs_dict = obs_dict["policy"]
 
-        concat_obs = self.concatenate_obs(obs_dict)
+#         concat_obs = self.concatenate_obs(obs_dict)
 
-        # h, _ = self.lstm(concat_obs)
-        z = self.net(concat_obs)
+#         # h, _ = self.lstm(concat_obs)
+#         z = self.net(concat_obs)
 
-        if z.dim() == 1:
-            z = z.unsqueeze(-1)  # Adds a trailing dimension to ensure (num_envs, obs) when only one observation
+#         if z.dim() == 1:
+#             z = z.unsqueeze(-1)  # Adds a trailing dimension to ensure (num_envs, obs) when only one observation
 
-        return z
+#         return z
 
-    def get_raw_inputs(self, obs_dict):
-        """
-        Retrieve prop or gt if exists
-        """
-        raw_inputs = torch.tensor([]).to(self.device)
-        # LOOP THROUGH DICT IN ALPHABETICAL ORDER!!!!!!!!!!!!!!!!!! fml
-        for k in sorted(obs_dict.keys()):
-            if k == "prop" or k == "gt" or k == "tactile":
-                raw_inputs = torch.cat((raw_inputs, obs_dict[k][:]), dim=-1)
-        return raw_inputs
+#     def get_raw_inputs(self, obs_dict):
+#         """
+#         Retrieve prop or gt if exists
+#         """
+#         raw_inputs = torch.tensor([]).to(self.device)
+#         # LOOP THROUGH DICT IN ALPHABETICAL ORDER!!!!!!!!!!!!!!!!!! fml
+#         for k in sorted(obs_dict.keys()):
+#             if k == "prop" or k == "gt" or k == "tactile":
+#                 raw_inputs = torch.cat((raw_inputs, obs_dict[k][:]), dim=-1)
+#         return raw_inputs
