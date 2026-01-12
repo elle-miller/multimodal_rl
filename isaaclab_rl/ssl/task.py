@@ -234,10 +234,17 @@ class AuxiliaryTask(ABC):
             for k, v in self.env.observation_space[type_k].items():
                 # create next states for the forward_dynamics
                 print(f"AuxiliaryTask: {k}: {type_k} tensor size {v.shape}")
+                # Determine dtype: rgb is uint8, depth and others are float32
+                if k == "rgb":
+                    storage_dtype = torch.uint8
+                elif k == "depth":
+                    storage_dtype = torch.float32
+                else:
+                    storage_dtype = torch.float32
                 self.memory.create_tensor(
                     name=k,
                     size=v.shape,
-                    dtype=torch.uint8 if k == "pixels" else torch.float32,
+                    dtype=storage_dtype,
                 )
                 observation_names.append(k)
             

@@ -41,7 +41,7 @@ class Writer:
         
         self.checkpoint_modules = {}
 
-        if agent_cfg["experiment"]["video_dir"] is not None:
+        if "video_dir" in agent_cfg["experiment"]:
             self.video_dir = agent_cfg["experiment"]["video_dir"]
         else:
             self.video_dir = "./videos"

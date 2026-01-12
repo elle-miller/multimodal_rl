@@ -349,7 +349,7 @@ class Memory:
                 for k in tensor.keys():
                     # k = {policy, aux}
                     if isinstance(tensor[k], dict):
-                        # obs_k = {pixels, prop}
+                        # obs_k = {rgb, depth, prop, etc.}
                         for obs_k, v in tensor[k].items():
                             if obs_k in self.tensors:
                                 self.tensors[obs_k][self.memory_index].copy_(
@@ -405,7 +405,7 @@ class Memory:
             for name in names:
                 obs = self.tensors_view[name][batch]
 
-                if name == "pixels" or name == "gt" or name == "prop" or name == "tactile":
+                if name == "rgb" or name == "depth" or name == "gt" or name == "prop" or name == "tactile":
                     minibatch_obs_dict[name] = obs
 
                 # append actions, log_prob, values, returns, advantages

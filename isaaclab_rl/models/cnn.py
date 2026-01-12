@@ -1,8 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from isaaclab_rl.wrappers.frame_stack import LazyFrames
+
 
 
 # https://github.com/denisyarats/pytorch_sac_ae/blob/master/sac_ae.py
@@ -87,26 +88,16 @@ class ImageEncoder(nn.Module):
         # convert to torch32 if uint8
         if obs.dtype is torch.uint8:
             obs = obs / 255.0
-        else:
-            raise TypeError(f"obs is not torch.uint8, but {obs.dtype}")
 
         if not self.channels_first:
             # Permuting makes the tensor non-contiguous(?)
-            obs = obs.permute((0, 3, 1, 2))
+            obs = obs.permute((0, 3, 1, 2)).contiguous()
 
         x = obs
         x = self.convs(x)
         x = self.flatten(x)
         x = self.fc(x)
         return x
-
-        h = self.forward_conv(obs)
-
-        out = self.head(h)
-
-        self.outputs["out"] = out
-
-        return out
 
 
 class ImageDecoder(nn.Module):

@@ -22,6 +22,7 @@ class Trainer:
         self,
         env,
         agents,
+        agent_cfg,
         num_timesteps_M=0,
         num_eval_envs=1,
         ssl_task=None,
@@ -37,6 +38,7 @@ class Trainer:
         self.cfg = _cfg
         self.env = env
         self.agent = agents
+        self.agent_cfg = agent_cfg
         self.writer = writer
         self.ssl_task = ssl_task
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -150,12 +152,20 @@ class Trainer:
             states = next_states 
             
             # save the first eval env video frames
-            if "pixels" in next_states["policy"].keys():
-                wandb_images.append(next_states["policy"]["pixels"][:][0].unsqueeze(0))
+            frame_skip = 10
+            if timestep % frame_skip == 0 and self.writer.wandb_session is not None:
+                # Collect rgb and/or depth for video logging from first env
+                frame_data = {}
+                if "rgb" in next_states["policy"].keys():
+                    frame_data["rgb"] = next_states["policy"]["rgb"][:][0]
+                if "depth" in next_states["policy"].keys():
+                    frame_data["depth"] = next_states["policy"]["depth"][:][0]
+                if frame_data:
+                    wandb_images.append(frame_data)
             
             # reset environments
             # the eval episodes get manually reset every ep_length
-            if timestep == 30: #timestep > 0 and (timestep % ep_length == 0) and self.num_eval_envs > 0:
+            if timestep > 0 and (timestep % ep_length == 0) and self.num_eval_envs > 0:
 
                 # take counter item, mean across eval envs
                 if "counters" in infos.keys():
@@ -196,36 +206,30 @@ class Trainer:
 
                 # upload video to wandb
                 if len(wandb_images) > 0:
-                    # 1. Stack and clean dimensions
-                    # Assuming wandb_images is list of [1, H, W, 4] (3 RGB + 1 Depth)
-                    video_tensor = torch.stack(wandb_images).squeeze(1).cpu() # Result: [T, H, W, 4]
+                    # Process rgb and depth separately
+                    if "rgb" in wandb_images[0]:
+                        # Stack RGB frames
+                        rgb_frames = [img["rgb"][..., :3] for img in wandb_images if "rgb" in img]
+                        rgb_tensor = torch.stack(rgb_frames).cpu()  # Result: [T, H, W, 3]
+                        rgb_array = rgb_tensor.numpy()
+                        if rgb_array.dtype != np.uint8:
+                            rgb_array = (rgb_array * 255).astype(np.uint8)
+                        # Transpose to [T, C, H, W]
+                        rgb_array = rgb_array.transpose(0, 3, 1, 2)
+                        wandb.log({"rgb_array": wandb.Video(rgb_array, fps=10, format="mp4")}, step=self.global_step)
 
-                    # 2. Extract RGB (Channels 0, 1, 2)
-                    rgb_array = video_tensor[..., :3].numpy()
-                    if rgb_array.dtype != np.uint8:
-                        rgb_array = (rgb_array * 255).astype(np.uint8)
-                    # Transpose to [T, C, H, W]
-                    rgb_array = rgb_array.transpose(0, 3, 1, 2)
+                    if "depth" in wandb_images[0]:
+                        # Process all depth frames to get [T, H, W] # get the first channel
+                        depth_frames = [img["depth"][..., 0] for img in wandb_images if "depth" in img]
+                        depth_tensor = torch.stack(depth_frames).cpu()
+                        depth_raw = depth_tensor.numpy()
+                        depth_color = cm.viridis(depth_raw)[..., :3] # Remove alpha channel
+                        depth_color = (depth_color * 255).astype(np.uint8)
+                        # Transpose to [T, C, H, W]
+                        depth_color = depth_color.transpose(0, 3, 1, 2)
+                        wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
 
-                    # 3. Extract and Process Depth (Channel 3)
-                    depth_raw = video_tensor[..., 3].numpy() # Result: [T, H, W]
-
-                    # Normalize depth to 0-1 for visualization
-                    # Note: Use a fixed max depth (e.g., 5.0m) or percentile to prevent flickering
-                    d_min, d_max = depth_raw.min(), 0.5
-                    depth_norm = (depth_raw - d_min) / (d_max - d_min + 1e-6)
-
-                    # Apply a Colormap (e.g., 'viridis' or 'magma') to turn [T, H, W] into [T, H, W, 3]
-                    # This makes distance much easier for humans to see than raw grayscale
-                    depth_color = cm.viridis(depth_norm)[..., :3] # Remove alpha channel
-                    depth_color = (depth_color * 255).astype(np.uint8)
-
-                    # Transpose to [T, C, H, W]
-                    depth_color = depth_color.transpose(0, 3, 1, 2)
-
-     
-                    wandb.log({"rgb_array": wandb.Video(rgb_array, fps=4, format="mp4")}, step=self.global_step)
-                    wandb.log({"depth_array": wandb.Video(depth_color, fps=4, format="mp4")}, step=self.global_step)
+                    wandb_images = []
 
                 self.returns_dict, self.infos_dict, self.mask, self.term_mask, self.trunc_mask = (
                     self.get_empty_return_dicts(infos)

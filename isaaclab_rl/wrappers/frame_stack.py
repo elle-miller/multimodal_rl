@@ -94,7 +94,7 @@ class LazyFrames:
             assert int_or_slice <= len(self._frames), f"Given idx(s) in {int_or_slice} out-of-bounds."
             return self._check_decompress(self._frames[int_or_slice])  # single frame
 
-        # Does this generalizes to both pixels and prop tensors, even when we want to framestack the props?
+        # Does this generalize to both rgb/depth and prop tensors, even when we want to framestack the props?
         return torch.concatenate(
             [self._check_decompress(x) for x in self._frames], dim=1 if self.channels_first else -1
         )
@@ -161,10 +161,10 @@ class FrameStack(gym.ObservationWrapper, gym.utils.RecordConstructorArgs):
 
         # We expect our environments to provide a dictionary of observation spaces of type `gym.spaces.Dict`
         # Also, we expect that the frame-stack computation should be handled *inside of the environment class*!!!
-        # Finally, we are only framestacking the pixels at the moment. This can be changed easily here.
+        # Finally, we are only framestacking rgb, depth, prop, tactile, and gt at the moment. This can be changed easily here.
         self.frames = {}
         for k, v in self.observation_space["policy"].items():
-            if k == "pixels" or k == "prop" or k == "tactile" or k == "gt":
+            if k == "rgb" or k == "depth" or k == "prop" or k == "tactile" or k == "gt":
                 self.frames[k] = deque(maxlen=obs_stack)
             else:
                 self.frames[k] = deque(maxlen=1)

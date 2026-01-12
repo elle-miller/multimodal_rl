@@ -155,12 +155,29 @@ class PPO:
         if self.memory is not None:
             print("****RL Agent Memory****")
             self.observation_names = []
+            
             for k, v in self.observation_space["policy"].items():
-                print(f"PPO: {k}: tensor size {v.shape}")
+                # Determine the correct dtype based on the observation key
+                if k == "rgb":
+                    storage_dtype = torch.uint8
+                elif k == "depth":
+                    storage_dtype = torch.float32  # Keep high precision for meters
+                elif k == "tactile":
+                    # Check if binary_tactile is enabled in config
+                    tactile_cfg = self.cfg.get("observations", {}).get("tactile_cfg", {})
+                    if tactile_cfg.get("binary_tactile", False):
+                        storage_dtype = torch.bool
+                    else:
+                        storage_dtype = torch.float32
+                else:
+                    storage_dtype = self.dtype
+
+                print(f"PPO: {k}: tensor size {v.shape} | dtype: {storage_dtype}")
+                
                 self.memory.create_tensor(
                     name=k,
                     size=v.shape,
-                    dtype=torch.uint8 if k == "pixels" else self.dtype,
+                    dtype=storage_dtype,
                 )
                 self.observation_names.append(k)
 
