@@ -7,7 +7,7 @@ import torch.nn as nn
 
 import kornia
 import numpy as np
-from isaaclab_rl.rl.memories import Memory
+from rigorous_rl.rl.memories import Memory
 import gc
 
 import torch.nn as nn

@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, Union
 
 import kornia
 
-from isaaclab_rl.wrappers.frame_stack import LazyFrames
+from rigorous_rl.wrappers.frame_stack import LazyFrames
 
 
 class Memory:

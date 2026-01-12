@@ -3,13 +3,13 @@ import torch.nn as nn
 import itertools
 import torch.nn.functional as F
 
-from isaaclab_rl.ssl.task import AuxiliaryTask
-from isaaclab_rl.ssl.physics_memory import DynamicsMemory
-from isaaclab_rl.ssl.reconstruction import CustomDecoder
+from rigorous_rl.ssl.task import AuxiliaryTask
+from rigorous_rl.ssl.physics_memory import DynamicsMemory
+from rigorous_rl.ssl.reconstruction import CustomDecoder
 
-from isaaclab_rl.models.mlp import MLP, Projector
-from isaaclab_rl.models.dynamics import DynamicsMLP
-from isaaclab_rl.wrappers.frame_stack import LazyFrames
+from rigorous_rl.models.mlp import MLP, Projector
+from rigorous_rl.models.dynamics import DynamicsMLP
+from rigorous_rl.wrappers.frame_stack import LazyFrames
 
 
 from copy import deepcopy

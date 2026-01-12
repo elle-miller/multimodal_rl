@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from isaaclab_rl.models.cnn import ImageEncoder
-from isaaclab_rl.models.mlp import MLP
-from isaaclab_rl.models.running_standard_scaler import RunningStandardScalerDict
+from rigorous_rl.models.cnn import ImageEncoder
+from rigorous_rl.models.mlp import MLP
+from rigorous_rl.models.running_standard_scaler import RunningStandardScalerDict
 
 methods = ["early", "intermediate"]
 

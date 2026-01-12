@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 from skrl import config
 from skrl.utils.spaces.torch import compute_space_size
 
-from isaaclab_rl.wrappers.frame_stack import LazyFrames
+from rigorous_rl.wrappers.frame_stack import LazyFrames
 
 
 class RunningStandardScalerDict(nn.Module):
