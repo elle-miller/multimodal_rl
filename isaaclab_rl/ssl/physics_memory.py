@@ -55,10 +55,21 @@ class DynamicsMemory:
         # outer loop of observation space (policy, aux)
         for type_k in sorted(self.env.observation_space.keys()):
             for k, v in self.env.observation_space[type_k].items():
+                # Determine the correct dtype based on the observation key
+                if k == "tactile":
+                    # Check if binary_tactile is enabled in config
+                    tactile_cfg = getattr(self.env, "tactile_cfg", None)
+                    if tactile_cfg is not None and tactile_cfg.get("binary_tactile", False):
+                        storage_dtype = torch.bool
+                    else:
+                        storage_dtype = self.dtype
+                else:
+                    storage_dtype = self.dtype
+                
                 # create next states for the forward_dynamics
                 # print(f"AuxiliaryTask: {k}: {type_k} tensor size {v.shape}")
                 # forward dynamics use sequence length
-                self.states[k] = torch.zeros((self.memory_size, self.seq_length, *v.shape), device=self.device, dtype=self.dtype)
+                self.states[k] = torch.zeros((self.memory_size, self.seq_length, *v.shape), device=self.device, dtype=storage_dtype)
                 # recon we don't
                 # self.states[k] = torch.zeros((self.memory_size, *v.shape), device=self.device, dtype=self.dtype)
                 observation_names.append(k)

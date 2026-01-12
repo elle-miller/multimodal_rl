@@ -41,15 +41,15 @@ class Writer:
         
         self.checkpoint_modules = {}
 
-        if agent_cfg["experiment"]["video_dir"] is not None:
+        if "video_dir" in agent_cfg["experiment"]:
             self.video_dir = agent_cfg["experiment"]["video_dir"]
         else:
             self.video_dir = "./videos"
 
+        self.last_uploaded = set()
 
         if agent_cfg["experiment"]["upload_videos"]:
             os.makedirs(self.video_dir, exist_ok=True)
-            self.last_uploaded = set()
 
         self.get_new_log_path()
 
@@ -133,8 +133,8 @@ class Writer:
             }
 
         tag = str(timestep)
-        if self.video_dir is not None:
-            self.log_videos(timestep)
+        # if self.video_dir is not None:
+        #     self.log_videos(timestep)
 
         # save this checkpoint no matter what
         if self.save_checkpoints == 2:

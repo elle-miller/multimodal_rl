@@ -1,8 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 from isaaclab_rl.wrappers.frame_stack import LazyFrames
+
 
 
 # https://github.com/denisyarats/pytorch_sac_ae/blob/master/sac_ae.py
@@ -40,7 +41,6 @@ class ImageEncoder(nn.Module):
     def __init__(self, obs_shape, latent_dim=50, num_layers=4, num_filters=32):
         super().__init__()
 
-        print("initialising cnn with ", num_layers, "and ", latent_dim, "feature dim")
 
         self.num_layers = num_layers
         self.num_filters = num_filters
@@ -50,6 +50,8 @@ class ImageEncoder(nn.Module):
         self.channels_first = True if np.argmin(obs_shape) == 0 else False
         self.num_channels = obs_shape[0] if self.channels_first else obs_shape[-1]
         self.img_dim = obs_shape[1]
+
+        print("initialising cnn with ", num_layers, "and ", latent_dim, "feature dim", "num channels", self.num_channels, self.img_dim)
 
         # First layer: 8x8 kernel focuses on broad features for downsampling
         # Second layer: reduce features, but increase channels for more features
@@ -86,26 +88,16 @@ class ImageEncoder(nn.Module):
         # convert to torch32 if uint8
         if obs.dtype is torch.uint8:
             obs = obs / 255.0
-        else:
-            raise TypeError(f"obs is not torch.uint8, but {obs.dtype}")
 
         if not self.channels_first:
             # Permuting makes the tensor non-contiguous(?)
-            obs = obs.permute((0, 3, 1, 2))
+            obs = obs.permute((0, 3, 1, 2)).contiguous()
 
         x = obs
         x = self.convs(x)
         x = self.flatten(x)
         x = self.fc(x)
         return x
-
-        h = self.forward_conv(obs)
-
-        out = self.head(h)
-
-        self.outputs["out"] = out
-
-        return out
 
 
 class ImageDecoder(nn.Module):

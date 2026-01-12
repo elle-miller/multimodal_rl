@@ -349,11 +349,9 @@ class Memory:
                 for k in tensor.keys():
                     # k = {policy, aux}
                     if isinstance(tensor[k], dict):
-                        # obs_k = {pixels, prop}
+                        # obs_k = {rgb, depth, prop, etc.}
                         for obs_k, v in tensor[k].items():
                             if obs_k in self.tensors:
-
-                                # print(name, obs_k, self.tensors[obs_k][self.memory_index].size(), v.size())
                                 self.tensors[obs_k][self.memory_index].copy_(
                                     v[:]
                                 )  # [:] at the end to activate LazyTensors
@@ -364,12 +362,7 @@ class Memory:
                         self.tensors[k][self.memory_index].copy_(tensor[k][:])
             else:
                 if name in self.tensors:
-                    # print(name, tensor.shape)
                     self.tensors[name][self.memory_index].copy_(tensor)
-
-    # def sample_all_sequential(self, names, mini_batches, sequence_length, augment):
-    #     size = len(self)
-    #         self.sample_all(self, names, mini_batches, sequence_length, augment)
 
     def sample_all(
         self,
@@ -412,7 +405,7 @@ class Memory:
             for name in names:
                 obs = self.tensors_view[name][batch]
 
-                if name == "pixels" or name == "gt" or name == "prop" or name == "tactile":
+                if name == "rgb" or name == "depth" or name == "gt" or name == "prop" or name == "tactile":
                     minibatch_obs_dict[name] = obs
 
                 # append actions, log_prob, values, returns, advantages

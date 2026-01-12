@@ -2,15 +2,17 @@ import copy
 import sys
 import torch
 import tqdm
-
+import wandb 
+import numpy as np
 from copy import deepcopy
 from isaaclab_rl.ssl.dynamics import ForwardDynamics
 from isaaclab_rl.ssl.reconstruction import Reconstruction
+import matplotlib.cm as cm
 
 SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "timesteps": 100000,  # number of timesteps to train for
     "headless": False,  # whether to use headless mode (no rendering)
-    "disable_progressbar": True,  # whether to disable the progressbar. If None, disable on non-TTY
+    "disable_progressbar": False,  # whether to disable the progressbar. If None, disable on non-TTY
     "close_environment_at_exit": False,  # whether to close the environment on normal program termination
 }
 
@@ -20,6 +22,7 @@ class Trainer:
         self,
         env,
         agents,
+        agent_cfg,
         num_timesteps_M=0,
         num_eval_envs=1,
         ssl_task=None,
@@ -35,6 +38,7 @@ class Trainer:
         self.cfg = _cfg
         self.env = env
         self.agent = agents
+        self.agent_cfg = agent_cfg
         self.writer = writer
         self.ssl_task = ssl_task
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -81,6 +85,8 @@ class Trainer:
         # metrics where we only care about mean over whole episode in context of training
         wandb_episode_dict = {}
         wandb_episode_dict["global_step"] = self.global_step
+
+        wandb_images = []
 
         best_return = 0
 
@@ -143,7 +149,20 @@ class Trainer:
                 self.rl_update += 1
                 rollout = 0
 
-            states = next_states
+            states = next_states 
+            
+            # save the first eval env video frames
+            frame_skip = 10
+            if timestep % frame_skip == 0 and self.writer.wandb_session is not None:
+                # Collect rgb and/or depth for video logging from first env
+                frame_data = {}
+                if "rgb" in next_states["policy"].keys():
+                    frame_data["rgb"] = next_states["policy"]["rgb"][:][0]
+                if "depth" in next_states["policy"].keys():
+                    frame_data["depth"] = next_states["policy"]["depth"][:][0]
+                if frame_data:
+                    wandb_images.append(frame_data)
+            
             # reset environments
             # the eval episodes get manually reset every ep_length
             if timestep > 0 and (timestep % ep_length == 0) and self.num_eval_envs > 0:
@@ -184,6 +203,33 @@ class Trainer:
                 # write checkpoints
                 if not play:
                     self.writer.write_checkpoint(mean_eval_return, timestep=self.global_step)
+
+                # upload video to wandb
+                if len(wandb_images) > 0:
+                    # Process rgb and depth separately
+                    if "rgb" in wandb_images[0]:
+                        # Stack RGB frames
+                        rgb_frames = [img["rgb"][..., :3] for img in wandb_images if "rgb" in img]
+                        rgb_tensor = torch.stack(rgb_frames).cpu()  # Result: [T, H, W, 3]
+                        rgb_array = rgb_tensor.numpy()
+                        if rgb_array.dtype != np.uint8:
+                            rgb_array = (rgb_array * 255).astype(np.uint8)
+                        # Transpose to [T, C, H, W]
+                        rgb_array = rgb_array.transpose(0, 3, 1, 2)
+                        wandb.log({"rgb_array": wandb.Video(rgb_array, fps=10, format="mp4")}, step=self.global_step)
+
+                    if "depth" in wandb_images[0]:
+                        # Process all depth frames to get [T, H, W] # get the first channel
+                        depth_frames = [img["depth"][..., 0] for img in wandb_images if "depth" in img]
+                        depth_tensor = torch.stack(depth_frames).cpu()
+                        depth_raw = depth_tensor.numpy()
+                        depth_color = cm.viridis(depth_raw)[..., :3] # Remove alpha channel
+                        depth_color = (depth_color * 255).astype(np.uint8)
+                        # Transpose to [T, C, H, W]
+                        depth_color = depth_color.transpose(0, 3, 1, 2)
+                        wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
+
+                    wandb_images = []
 
                 self.returns_dict, self.infos_dict, self.mask, self.term_mask, self.trunc_mask = (
                     self.get_empty_return_dicts(infos)
