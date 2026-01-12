@@ -3,19 +3,12 @@
 `rigorous_rl` provides a streamlined and robust foundation for training robotic agents in Isaac Lab with PPO. It is designed to be used as a core dependency for your experiments, allowing you to focus on environment design while the library handles the RL "heavy lifting." This library works in tandem with `roto`, which provides ready-to-use example environments and optimised agents.
 
 ## ✨ Features
-- Dictionary observations: Flexible handling of multimodal inputs (RGB, Depth, Proprioception, Tactile, Ground-truth states).
-- Observation stacking: `LazyFrame` frame stacking to handle partially observable environments.
-- Transparent codebase: The entire RL (PPO) logic is distilled into four readable files.
-- Self-supervision: Integrated Self-Supervised Learning (SSL) modules for representation learning (e.g. world models 🌏).
-- Robust research: Integrated hyperparameter optimisation with Optuna 
-- Evaluation rigor: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting.
+- **Multimodal perception**: Designed to handle flexible dictionary observations (RGB, Depth, Proprioception, Tactile, and Ground-truth states) with integrated Self-Supervised Learning (SSL) for enhanced representation learning (e.g. learning world models 🌏).
+- **Observation stacking**: Uses `LazyFrame` stacking to handle partially observable environments, essential for real-world robotics.
+- **Transparent codebase**: Most RL libraries sacrifice clarity for modularity. We condense the entire PPO logic into four readable files, making it easy to inspect "under-the-hood".
+- **Robust research**: Integrated hyperparameter optimisation with Optuna to ensure fair comparisons and well-tuned agents.
+- **Evaluation rigor**: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting.
 ![rigorous_rl](diagram.png)
-
-**Features**
-- Dictionary observations (makes life easy if you have different observation types you want to swap in and out)
-- Wrappers for observation stacking (important for partially observable envs!)
-- Split environments for training and evaluation (will get more accurate measure of agent learning)
-- All RL related code is simplified into 4 files (you can easily figure out what's going on and edit)
 
 ## Installation
 
@@ -30,9 +23,7 @@ pip install -e .
 ```
 You should now see it with `pip show rigorous_rl`.
 
-3. Setup your own project!
-
-Check out [roto](https://github.com/elle-miller/roto) to use existing environments or as inspiration to build your  own.
+3. Setup your own project! Check out [roto](https://github.com/elle-miller/roto) to use existing environments or as a template for your own.
 
 ## 🔬 Motivation: Why "Rigorous" RL?
 Are you a researcher wanting to get into Reinforcement Learning with Isaac Lab as painlessly as possible? Rigorous RL is for you!
