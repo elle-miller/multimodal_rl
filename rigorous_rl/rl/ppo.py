@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch import nn
 from typing import Dict, Optional, Tuple, Union
 
-from isaaclab_rl.rl.memories import Memory
-from isaaclab_rl.models.running_standard_scaler import RunningStandardScaler
+from rigorous_rl.rl.memories import Memory
+from rigorous_rl.models.running_standard_scaler import RunningStandardScaler
 
 # [start-config-dict-torch]
 PPO_DEFAULT_CONFIG = {

@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 from typing import Any, Mapping, Optional, Tuple, Union
 
-from isaaclab_rl.models.mlp import MLP
+from rigorous_rl.models.mlp import MLP
 
 activations_dict = {
     "tanh": nn.Tanh(),

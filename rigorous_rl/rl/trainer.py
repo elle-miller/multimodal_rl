@@ -5,8 +5,8 @@ import tqdm
 import wandb 
 import numpy as np
 from copy import deepcopy
-from isaaclab_rl.ssl.dynamics import ForwardDynamics
-from isaaclab_rl.ssl.reconstruction import Reconstruction
+from rigorous_rl.ssl.dynamics import ForwardDynamics
+from rigorous_rl.ssl.reconstruction import Reconstruction
 import matplotlib.cm as cm
 
 SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {

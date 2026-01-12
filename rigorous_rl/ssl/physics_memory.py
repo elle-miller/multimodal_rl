@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from typing import Tuple, Optional
-from isaaclab_rl.wrappers.frame_stack import LazyFrames
+from rigorous_rl.wrappers.frame_stack import LazyFrames
 
 
 class DynamicsMemory:

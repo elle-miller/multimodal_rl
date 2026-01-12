@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from isaaclab_rl.wrappers.frame_stack import LazyFrames
+from rigorous_rl.wrappers.frame_stack import LazyFrames
 
 
 

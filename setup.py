@@ -1,4 +1,4 @@
-"""Installation script for the 'isaaclab_rl' python package."""
+"""Installation script for the 'rigorous_rl' python package."""
 
 import os
 
@@ -28,11 +28,11 @@ INSTALL_REQUIRES = [
 
 # Installation operation
 setup(
-    name="isaaclab_rl",
-    packages=["isaaclab_rl"],
+    name="rigorous_rl",
+    packages=["rigorous_rl"],
     author="Elle Miller",
     maintainer="Elle Miller",
-    url="https://github.com/elle-miller/isaaclab_rl",
+    url="https://github.com/elle-miller/rigorous_rl",
     version="1.0.0",
     description="project",
     keywords=["isaac lab"],

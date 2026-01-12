@@ -1,8 +1,15 @@
-# isaaclab_rl
+# Rigorous RL (`rigorous_rl`)
 
-A library for training robotic agents in Isaac Lab with PPO, with in-built hyperparameter optimisation, and extensive logging and plotting options. This is a twin library with [isaaclab_rl_project](https://github.com/elle-miller/isaaclab_rl_project), which contains an example environment and blank template environment.
+`rigorous_rl` provides a streamlined and robust foundation for training robotic agents in Isaac Lab with PPO. It is designed to be used as a core dependency for your experiments, allowing you to focus on environment design while the library handles the RL "heavy lifting." This library works in tandem with `roto`, which provides ready-to-use example environments and optimised agents.
 
-![isaaclab_rl](https://github.com/user-attachments/assets/72036a2f-41ab-4317-ad30-8a165afa83a5)
+## ✨ Features
+- Dictionary observations: Flexible handling of multimodal inputs (RGB, Depth, Proprioception, Tactile, Ground-truth states).
+- Observation stacking: `LazyFrame` frame stacking to handle partially observable environments.
+- Transparent codebase: The entire RL (PPO) logic is distilled into four readable files.
+- Self-supervision: Integrated Self-Supervised Learning (SSL) modules for representation learning (e.g. world models 🌏).
+- Robust research: Integrated hyperparameter optimisation with Optuna 
+- Evaluation rigor: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting.
+![rigorous_rl](diagram.png)
 
 **Features**
 - Dictionary observations (makes life easy if you have different observation types you want to swap in and out)
@@ -14,51 +21,57 @@ A library for training robotic agents in Isaac Lab with PPO, with in-built hyper
 
 1. Install Isaac Lab via pip with [these instructions](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/isaaclab_pip_installation.html)
 
-2. Install `isaaclab_rl` as a local editable package.
+2. Install `rigorous_rl` as a local editable package.
 
 ```
-git clone git@github.com:elle-miller/isaaclab_rl.git
-cd isaaclab_rl
+git clone git@github.com:elle-miller/rigorous_rl.git
+cd rigorous_rl
 pip install -e .
 ```
-You should now see it with `pip show isaaclab_rl`.
+You should now see it with `pip show rigorous_rl`.
 
 3. Setup your own project!
 
-Now follow the README instructions here [isaaclab_rl_project](https://github.com/elle-miller/isaaclab_rl_project).
+Check out [roto](https://github.com/elle-miller/roto) to use existing environments or as inspiration to build your  own.
 
+## 🔬 Motivation: Why "Rigorous" RL?
+Are you a researcher wanting to get into Reinforcement Learning with Isaac Lab as painlessly as possible? Rigorous RL is for you!
 
-## Motivation for this library
+In modern robotics research, RL implementations are often optimised for "demos" rather than science. This leads to several pain points that Rigorous RL solves:
 
-Are you a researcher wanting to get into using RL with Isaac Lab as painlessly as possible? This library is for you!
+- **Code Transparency:** Most RL libraries sacrifice clarity for modularity, spreading a single algorithm's logic across dozens of files. This makes it difficult to inspect "under-the-hood". We condense our core logic into 4  files, so you know exactly what your gradients are doing.
 
-There are many libraries with various RL implementations out there. However, many of these libraries do not provide support for doing robust RL research, such as reporting mean evaluation returns, correct number of timesteps, or providing integrated hyperparameter optimisation. These are well established norms in the RL research community, but are not yet consistently present in RL+robotics research. This was the library I made for my own PhD research, and am open-sourcing it to avoid others having to repeat re-implement all these components :)
+- **Scientific Reporting:** In many robotics papers, standard RL norms - like separating evaluation returns from training returns and reporting returns across fixed seeds - are overlooked. Rigorous RL enforces these standards by default, ensuring your results are robust.
 
-## How it works
+- **Hyperparameter Integrity:** RL agent performance is a product of tuning, not just algorithms. We provide integrated Hyperparameter Optimization (HPO) tools to ensure your agents are well-tuned and your comparisons are fair.
 
-`isaaclab_rl` contains all the core components to run RL in Isaac Lab, that I will continuously add to and improve. Your own project `isaaclab_rl_project` runs on these modules, but is completely separated so you can do what you like, and optionally pull changes from `isaaclab_rl`. 
+- **Multimodal Perception:** Robotics is rarely just about state vectors. Our framework is designed from the ground up to handle multimodal observations (RGB, depth, proprioception, tactile) with self-supervision for enhanced representation learning and observation stacking to tackle partially observable environments.
 
-`isaaclab_rl` provides 5 core functionalities:
+If you are new to RL, this library removes the "re-implementation tax" and lets you focus on the science.
 
-1. **rl**: anything RL related is here
-2. **ssl**: anything self-supervision related is here
-2. **models**: base models used by RL e.g. MLP, CNN, running standard scaler 
-3. **tools**: scripts to produce those nice RL paper plots, and extra stuff like latent trajectory visualisation.
-4. **wrappers**: wrappers for observation stacking and isaaclab
+## 🏗 How it Works
+`rigorous_rl` contains the RL engine, while your project repo contains the environments/research/science. This separation allows you to pull updates from the core library without messy merge conflicts in your environment code.
 
-## Credits
-The PPO implementation is a streamlined version of the one provided by [SKRL](https://github.com/Toni-SM/skrl), full credits to toni-sm for this. The reason I am providing a local version instead of importing from SKRL is because there are major breaking changes, e.g. all irrelevant functions are deleted, logic is different to be able to reporting mean evaluation returns.  
+`rigorous_rl` provides 5 core functionalities:
+
+1. **rl**: Clean PPO implementation
+2. **ssl**: Modules for self-supervision learning
+2. **models**: Standardised backbones (MLPs, CNNs) and running scalers.
+3. **tools**: Scripts to produce nice RL paper plots, and extra stuff like latent trajectory visualisation.
+4. **wrappers**: Wrappers for observation stacking and Isaac Lab
+
+## 📜 Credits
+The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). Full credits to toni-sm for the initial foundation. This local version has been refactored to accomodate the aforementioned changes.
 
 
 ## 📚 Citation
-If this code has been helpful for your research, please cite:
-
+If this framework helps your research, please cite:
 ```
-@misc{miller2025_isaaclab_rl,
+@misc{miller2026_rigorous_rl,
   author       = {Elle Miller},
-  title        = {isaaclab_rl},
-  year         = {2025},
-  howpublished = {\url{https://github.com/elle-miller/isaaclab_rl}},
+  title        = {rigorous_rl: High-Integrity RL for Isaac Lab},
+  year         = {2026},
+  howpublished = {\url{https://github.com/elle-miller/rigorous_rl}},
   note         = {GitHub repository}
 }
 ```
