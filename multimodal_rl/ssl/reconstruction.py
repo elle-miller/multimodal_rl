@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rigorous_rl.ssl.task import AuxiliaryTask
-from rigorous_rl.wrappers.frame_stack import LazyFrames
+from multimodal_rl.ssl.task import AuxiliaryTask
+from multimodal_rl.wrappers.frame_stack import LazyFrames
 
 
 class CustomDecoder(nn.Module):

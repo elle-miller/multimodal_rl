@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from rigorous_rl.models.cnn import ImageEncoder
-from rigorous_rl.models.mlp import MLP
-from rigorous_rl.models.running_standard_scaler import RunningStandardScalerDict
+from multimodal_rl.models.cnn import ImageEncoder
+from multimodal_rl.models.mlp import MLP
+from multimodal_rl.models.running_standard_scaler import RunningStandardScalerDict
 
 methods = ["early", "intermediate"]
 

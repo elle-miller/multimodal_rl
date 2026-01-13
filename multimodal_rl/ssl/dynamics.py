@@ -3,13 +3,13 @@ import torch.nn as nn
 import itertools
 import torch.nn.functional as F
 
-from rigorous_rl.ssl.task import AuxiliaryTask
-from rigorous_rl.ssl.physics_memory import DynamicsMemory
-from rigorous_rl.ssl.reconstruction import CustomDecoder
+from multimodal_rl.ssl.task import AuxiliaryTask
+from multimodal_rl.ssl.physics_memory import DynamicsMemory
+from multimodal_rl.ssl.reconstruction import CustomDecoder
 
-from rigorous_rl.models.mlp import MLP, Projector
-from rigorous_rl.models.dynamics import DynamicsMLP
-from rigorous_rl.wrappers.frame_stack import LazyFrames
+from multimodal_rl.models.mlp import MLP, Projector
+from multimodal_rl.models.dynamics import DynamicsMLP
+from multimodal_rl.wrappers.frame_stack import LazyFrames
 
 
 from copy import deepcopy

@@ -1,4 +1,4 @@
-"""Installation script for the 'rigorous_rl' python package."""
+"""Installation script for the 'multimodal_rl' python package."""
 
 import os
 
@@ -28,11 +28,11 @@ INSTALL_REQUIRES = [
 
 # Installation operation
 setup(
-    name="rigorous_rl",
-    packages=["rigorous_rl"],
+    name="multimodal_rl",
+    packages=["multimodal_rl"],
     author="Elle Miller",
     maintainer="Elle Miller",
-    url="https://github.com/elle-miller/rigorous_rl",
+    url="https://github.com/elle-miller/multimodal_rl",
     version="1.0.0",
     description="project",
     keywords=["isaac lab"],
