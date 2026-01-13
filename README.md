@@ -1,4 +1,5 @@
-# Multimodal RL (`multimodal_rl`)
+<!-- # Multimodal RL (`multimodal_rl`) -->
+![multimodal_rl](mmrl.png)
 
 Real-world robotics must move beyond simple state vectors. `multimodal_rl` provides a streamlined and robust foundation for training robotic agents in Isaac Lab that perceive the world through multiple lenses.
 
@@ -11,7 +12,8 @@ This library is designed as a core research dependency. It handles the RL "heavy
 - **Transparent codebase**: Most RL libraries sacrifice clarity for modularity. We condense the entire PPO logic into four readable files, making it easy to inspect "under-the-hood".
 - **Robust research**: Integrated hyperparameter optimisation with Optuna to ensure fair comparisons and well-tuned agents.
 - **Evaluation rigor**: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting.
-![multimodal_rl](diagram.png)
+
+
 
 ## Installation
 
@@ -39,6 +41,8 @@ You should now see it with `pip show multimodal_rl`.
 2. **models**: Standardised backbones (MLPs, CNNs) and running scalers.
 3. **tools**: Scripts to produce nice RL paper plots, and extra stuff like latent trajectory visualisation.
 4. **wrappers**: Wrappers for observation stacking and Isaac Lab
+
+![multimodal_rl](diagram.png)
 
 ## 📜 Credits
 The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). This version has been refactored to prioritise multimodal fusion, evaluation rigor, and transparency.
