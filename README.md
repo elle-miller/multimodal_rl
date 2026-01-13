@@ -6,7 +6,7 @@ This library is designed as a core research dependency. It handles the RL "heavy
 
 ## ✨ Features
 - **Multimodal perception**: Native support for flexible dictionary observations (RGB, Depth, Proprioception, Tactile, and Ground-truth states).
-- **Self-supervised learning**: Easy integration of auxiliary tasks for enhanced representation learning (e.g. reconstruction, learning world models 🌏).
+- **Self-supervised learning**: Built-in integration for SSL auxiliary tasks (reconstruction, world models 🌏) to accelerate representation learning from multimodal observations.
 - **Observation stacking**: Uses `LazyFrame` stacking to handle partially observable environments, essential for real-world robotics.
 - **Transparent codebase**: Most RL libraries sacrifice clarity for modularity. We condense the entire PPO logic into four readable files, making it easy to inspect "under-the-hood".
 - **Robust research**: Integrated hyperparameter optimisation with Optuna to ensure fair comparisons and well-tuned agents.
@@ -41,7 +41,7 @@ You should now see it with `pip show multimodal_rl`.
 4. **wrappers**: Wrappers for observation stacking and Isaac Lab
 
 ## 📜 Credits
-The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). Full credits to toni-sm for the initial foundation. This local version has been refactored to accomodate the aforementioned changes.
+The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). This version has been refactored to prioritise multimodal fusion, evaluation rigor, and transparency.
 
 
 ## 📚 Citation
