@@ -1,3 +1,9 @@
+"""Multimodal encoder for fusing diverse observation types.
+
+Supports early fusion (concatenation) and intermediate fusion (projection) strategies
+for combining visual (RGB, depth) and state-based (proprioception, tactile, ground-truth) observations.
+"""
+
 import torch
 import torch.nn as nn
 
@@ -5,135 +11,167 @@ from multimodal_rl.models.cnn import ImageEncoder
 from multimodal_rl.models.mlp import MLP
 from multimodal_rl.models.running_standard_scaler import RunningStandardScalerDict
 
-methods = ["early", "intermediate"]
+FUSION_METHODS = ["early", "intermediate"]
+
 
 class Encoder(nn.Module):
-    """Encoder handling early and intermediate fusion of raw and latent inputs."""
+    """Multimodal encoder supporting early and intermediate fusion strategies.
+    
+    Early fusion: Raw state observations are concatenated directly with visual latents.
+    Intermediate fusion: State observations are projected to a latent space before fusion.
+    
+    Args:
+        observation_space: Dictionary mapping observation names to their shapes.
+        action_space: Action space (unused but kept for API compatibility).
+        env_cfg: Environment configuration.
+        config_dict: Configuration dictionary containing encoder settings:
+            - method: Fusion method ("early" or "intermediate")
+            - hiddens: List of hidden layer sizes for final MLP
+            - activations: List of activation functions
+            - layernorm: Whether to use layer normalization
+            - latent_state_dim: Latent dimension for intermediate fusion (default: 64)
+            - state_preprocessor: Whether to use state preprocessing
+        device: Device to run computations on.
+    """
 
     def __init__(self, observation_space, action_space, env_cfg, config_dict, device):
         super().__init__()
-
+        
         self.method = config_dict["encoder"]["method"]
-        assert self.method in methods
+        if self.method not in FUSION_METHODS:
+            raise ValueError(f"Unknown fusion method: {self.method}. Must be one of {FUSION_METHODS}")
+        
         self.device = device
-
         self.observation_space = observation_space
         self.action_space = action_space
-
-        self.num_inputs = 0
         self.hiddens = config_dict["encoder"]["hiddens"]
         self.activations = config_dict["encoder"]["activations"]
-        
-        # Latent dimension for state projections in intermediate fusion
         self.latent_state_dim = config_dict["encoder"].get("latent_state_dim", 64)
 
-        # Standard scaler
+        # Initialize state preprocessor if specified
         if config_dict["encoder"]["state_preprocessor"] is not None:
             self.state_preprocessor = RunningStandardScalerDict(size=observation_space, device=device)
         else:
             self.state_preprocessor = None
 
-        # Dict to hold projection MLPs for intermediate fusion
-        if self.method == "intermediate":
-            print("Creating state encoders for intermediate fusion")
-            self.state_encoders = nn.ModuleDict()
-        else:
-            self.state_encoders = None
-
-        # Dict to hold CNNs for visual inputs (rgb and depth)
+        # Initialize encoders based on fusion method
+        self.state_encoders = nn.ModuleDict() if self.method == "intermediate" else None
         self.cnns = nn.ModuleDict()
-
-        # Configure relevant preprocessing
-        # We sort keys to ensure deterministic ordering of the input vector
+        
+        num_inputs = 0
+        
+        # Build encoders for each observation type
+        # Sort keys for deterministic ordering
         for k in sorted(observation_space.keys()):
             v = observation_space[k]
 
-            if k == "rgb" or k == "depth":
+            if k in ("rgb", "depth"):
+                # Visual inputs: process through CNN
                 latent_pixel_dim = config_dict["observations"]["pixel_cfg"]["latent_pixel_dim"]
-                # Create separate CNN for each visual input type
                 self.cnns[k] = ImageEncoder(v.shape, latent_pixel_dim).to(device)
-                self.num_inputs += latent_pixel_dim
+                num_inputs += latent_pixel_dim
 
-            elif k in ["prop", "gt", "tactile"]:
+            elif k in ("prop", "gt", "tactile"):
+                # State inputs: process based on fusion method
                 input_dim = v.shape[0]
                 
                 if self.method == "early":
-                    self.num_inputs += input_dim
-                
+                    num_inputs += input_dim
                 elif self.method == "intermediate":
-                    # Create a small MLP to project raw state to a latent vector
-                    # Using a single hidden layer or direct projection
+                    # Project state to latent space
                     projection_mlp = MLP(
-                        input_dim, 
-                        [self.latent_state_dim], 
-                        self.activations, 
+                        input_dim,
+                        [self.latent_state_dim],
+                        self.activations,
                         layernorm=config_dict["encoder"]["layernorm"]
                     ).to(device)
-                    print(f"Created projection MLP for '{k}' with input dim {input_dim} to latent dim {self.latent_state_dim}")
                     self.state_encoders[k] = projection_mlp
-                    self.num_inputs += self.latent_state_dim
+                    num_inputs += self.latent_state_dim
 
+        self.num_inputs = num_inputs
         self.num_outputs = self.hiddens[-1]
+        
+        # Final fusion MLP
         self.net = MLP(
-            self.num_inputs, 
-            self.hiddens, 
-            self.activations, 
+            num_inputs,
+            self.hiddens,
+            self.activations,
             layernorm=config_dict["encoder"]["layernorm"]
         ).to(device)
 
     def forward(self, obs_dict, detach=False, train=False):
-        # Handle potential nesting
-        if "policy" in obs_dict.keys():
+        """Forward pass through the encoder.
+        
+        Args:
+            obs_dict: Dictionary of observations, optionally nested under "policy" key.
+            detach: If True, detach gradients from inputs.
+            train: If True, update running statistics for preprocessing.
+            
+        Returns:
+            Encoded representation tensor of shape (batch_size, num_outputs).
+        """
+        # Handle nested observation dictionaries
+        if "policy" in obs_dict:
             obs_dict = obs_dict["policy"]
 
         if detach:
             obs_dict = {key: value.detach() for key, value in obs_dict.items()}
 
-        # Scale inputs
+        # Preprocess observations if scaler is available
         if self.state_preprocessor is not None:
             obs_dict = self.state_preprocessor(obs_dict, train)
 
-        # 1. Get Latent Visual Inputs (always processed via CNN)
-        latent_visuals = self.get_latent_inputs(obs_dict)
+        # Process visual inputs through CNNs
+        latent_visuals = self._get_latent_visuals(obs_dict)
 
-        # 2. Process State Inputs based on method
+        # Process state inputs based on fusion method
         if self.method == "early":
-            # Just concatenate raw tensors
-            raw_states = self.get_raw_inputs(obs_dict)
+            raw_states = self._get_raw_states(obs_dict)
             concat_obs = torch.cat((raw_states, latent_visuals), dim=-1)
-        
         elif self.method == "intermediate":
-            # Pass each state through its specific projection MLP
             processed_states = []
             for k in sorted(obs_dict.keys()):
                 if k in self.state_encoders:
                     z_state = self.state_encoders[k](obs_dict[k][:])
                     processed_states.append(z_state)
-            
-            # Concatenate projected states with visual latents
             concat_obs = torch.cat(processed_states + [latent_visuals], dim=-1)
 
-        # Final MLP head
+        # Final MLP projection
         z = self.net(concat_obs)
 
+        # Ensure batch dimension exists
         if z.dim() == 1:
-            z = z.unsqueeze(0) 
+            z = z.unsqueeze(0)
 
         return z
 
-    def get_raw_inputs(self, obs_dict):
-        """Retrieve and concat prop, gt, or tactile raw values."""
+    def _get_raw_states(self, obs_dict):
+        """Extract and concatenate raw state observations.
+        
+        Args:
+            obs_dict: Dictionary of observations.
+            
+        Returns:
+            Concatenated tensor of raw state observations.
+        """
         raw_inputs = []
         for k in sorted(obs_dict.keys()):
-            if k in ["prop", "gt", "tactile"]:
+            if k in ("prop", "gt", "tactile"):
                 raw_inputs.append(obs_dict[k][:])
-        return torch.cat(raw_inputs, dim=-1) if raw_inputs else torch.tensor([]).to(self.device)
+        return torch.cat(raw_inputs, dim=-1) if raw_inputs else torch.tensor([], device=self.device)
 
-    def get_latent_inputs(self, obs_dict):
-        """Pass visual inputs through CNN."""
+    def _get_latent_visuals(self, obs_dict):
+        """Process visual observations through CNNs.
+        
+        Args:
+            obs_dict: Dictionary of observations.
+            
+        Returns:
+            Concatenated tensor of visual latent representations.
+        """
         latent_inputs = []
         for k in sorted(obs_dict.keys()):
-            if k == "rgb" or k == "depth":
+            if k in ("rgb", "depth"):
                 z = self.cnns[k](obs_dict[k][:])
                 latent_inputs.append(z)
-        return torch.cat(latent_inputs, dim=-1) if latent_inputs else torch.tensor([]).to(self.device)
+        return torch.cat(latent_inputs, dim=-1) if latent_inputs else torch.tensor([], device=self.device)

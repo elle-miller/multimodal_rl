@@ -11,7 +11,7 @@ This library is designed as a core research dependency. It handles the RL "heavy
 - **Observation stacking**: Uses `LazyFrame` stacking to handle partially observable environments, essential for real-world robotics.
 - **Transparent codebase**: Most RL libraries sacrifice clarity for modularity. We condense the entire PPO logic into four readable files, making it easy to inspect "under-the-hood".
 - **Robust research**: Integrated hyperparameter optimisation with Optuna to ensure fair comparisons and well-tuned agents.
-- **Evaluation rigor**: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting.
+- **Evaluation rigor**: Dedicated split for training and evaluation parallelised environments to ensure efficient and accurate performance reporting. Evaluation uses frozen policy snapshots taken at episode boundaries, ensuring consistent metrics throughout each evaluation episode even as the networks update throughout training. 
 
 
 
@@ -42,7 +42,12 @@ You should now see it with `pip show multimodal_rl`.
 3. **tools**: Scripts to produce nice RL paper plots, and extra stuff like latent trajectory visualisation.
 4. **wrappers**: Wrappers for observation stacking and Isaac Lab
 
+
+
 ![multimodal_rl](diagram.png)
+
+## Evaluation Procedure
+Evaluation runs continuously in parallel with training using dedicated evaluation environments. At each episode boundary (every `max_episode_length` steps), the current policy and encoder are snapshotted into frozen copies. These frozen models are used exclusively for evaluation, ensuring that each evaluation episode uses a consistent policy version even as training continues and updates the live policy. Episode metrics (returns, info logs) are accumulated with proper masking for terminated/truncated episodes, and logged at episode boundaries. This design ensures evaluation metrics accurately reflect policy performance at specific training checkpoints.
 
 ## 📜 Credits
 The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). This version has been refactored to prioritise multimodal fusion, evaluation rigor, and transparency.
