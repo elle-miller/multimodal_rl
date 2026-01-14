@@ -122,6 +122,7 @@ SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "headless": False,
     "disable_progressbar": False,
     "close_environment_at_exit": False,
+    "staggered_resets": True,  # Stagger training environment resets for better sample diversity
 }
 
 
@@ -164,6 +165,7 @@ class Trainer:
         self.headless = self.cfg.get("headless", False)
         self.disable_progressbar = self.cfg.get("disable_progressbar", False)
         self.close_environment_at_exit = self.cfg.get("close_environment_at_exit", True)
+        self.staggered_resets = self.cfg.get("staggered_resets", True)
 
         # Training parameters
         # Global steps accumulate over all environments: global_step = num_train_envs * training_steps
@@ -209,6 +211,21 @@ class Trainer:
         states, infos = self.env.reset(hard=True)
         train_states, eval_states = self.split_train_eval_obs(states, self.num_eval_envs)
         self.agent.memory.reset()
+        
+        # Initialize staggered resets for training environments
+        # This prevents all environments from resetting simultaneously,
+        # improving sample diversity and training stability
+        if self.staggered_resets:
+            max_ep_len = self.env.env.unwrapped.max_episode_length
+            # Only stagger training environments (exclude eval envs)
+            train_env_ids = torch.arange(
+                self.num_eval_envs, self.num_envs, dtype=torch.long, device=self.device
+            )
+            # Uniformly distribute initial episode lengths across [0, max_episode_length)
+            # This ensures training environments timeout at different times
+            self.env.env.unwrapped.episode_length_buf[train_env_ids] = torch.randint(
+                0, max_ep_len, (len(train_env_ids),), device=self.device, dtype=torch.long
+            )
 
         # Initialize episode tracker
         info_keys = list(infos.get("log", {}).keys())

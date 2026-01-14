@@ -1,5 +1,5 @@
 <!-- # Multimodal RL (`multimodal_rl`) -->
-![multimodal_rl](mmrl.png)
+![multimodal_rl](readme_assets/mmrl.png)
 
 Real-world robotics must move beyond simple state vectors. `multimodal_rl` provides a streamlined and robust foundation for training robotic agents in Isaac Lab that perceive the world through multiple lenses.
 
@@ -44,10 +44,19 @@ You should now see it with `pip show multimodal_rl`.
 
 
 
-![multimodal_rl](diagram.png)
+![multimodal_rl](readme_assets/diagram.png)
 
-## Evaluation Procedure
-Evaluation runs continuously in parallel with training using dedicated evaluation environments. At each episode boundary (every `max_episode_length` steps), the current policy and encoder are snapshotted into frozen copies. These frozen models are used exclusively for evaluation, ensuring that each evaluation episode uses a consistent policy version even as training continues and updates the live policy. Episode metrics (returns, info logs) are accumulated with proper masking for terminated/truncated episodes, and logged at episode boundaries. This design ensures evaluation metrics accurately reflect policy performance at specific training checkpoints.
+### Evaluation Procedure
+Evaluation runs continuously in parallel with training using dedicated evaluation environments. At each episode boundary (every `max_episode_length` steps), the current policy and encoder are snapshotted into frozen copies. These frozen models are used exclusively for evaluation, ensuring that each evaluation episode uses a consistent policy version even as training continues and updates the live policy. Evaluation environments are visually distinguished in the simulation (typically marked with pink boxes) and reset synchronously at episode boundaries. Episode metrics (returns, info logs) are accumulated with proper masking for terminated/truncated episodes, and logged at episode boundaries.
+
+### Staggered Resets 
+
+Training environments use staggered resets by default, where each environment starts with a random initial episode length offset uniformly distributed across `[0, max_episode_length)`. This prevents all training environments from resetting simultaneously, improving sample diversity and training stability by ensuring environments are at different stages of their episodes throughout training.
+
+<img src="readme_assets/eval.gif" 
+     width="400" 
+     border="1"
+     style="display: block; margin: 0 auto;"/>
 
 ## 📜 Credits
 The PPO implementation is a streamlined and modified version of [SKRL](https://github.com/Toni-SM/skrl). This version has been refactored to prioritise multimodal fusion, evaluation rigor, and transparency.
