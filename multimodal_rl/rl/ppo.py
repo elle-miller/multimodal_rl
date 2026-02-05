@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, Union
 
-from multimodal_rl.models.running_standard_scaler import RunningStandardScaler
 from multimodal_rl.rl.memories import Memory
 
 PPO_DEFAULT_CONFIG = {
@@ -41,6 +40,7 @@ PPO_DEFAULT_CONFIG = {
     "value_loss_scale": 1.0,
     "kl_threshold": 0,
     "time_limit_bootstrap": False,
+    "num_critics": None,  # If None, auto-detect from reward shape. If > 1, automatically create MultiCritic.
     "experiment": {
         "directory": "",
         "experiment_name": "",
@@ -64,8 +64,7 @@ class PPO:
     Args:
         encoder: Encoder network for multimodal observations.
         policy: Policy network (GaussianPolicy).
-        value: Value network (DeterministicValue).
-        value_preprocessor: Value preprocessor (e.g., RunningStandardScaler).
+        value: Value network (DeterministicValue) or MultiCritic wrapper for multiple critics.
         memory: Memory buffer for storing transitions (optional).
         observation_space: Observation space specification.
         action_space: Action space specification.
@@ -82,7 +81,6 @@ class PPO:
         encoder,
         policy,
         value,
-        value_preprocessor,
         memory: Optional[Union[Memory, Tuple[Memory]]] = None,
         observation_space: Optional[Union[int, Tuple[int], gym.Space, gymnasium.Space]] = None,
         action_space: Optional[Union[int, Tuple[int], gym.Space, gymnasium.Space]] = None,
@@ -108,7 +106,7 @@ class PPO:
         self._device_type = torch.device(self.device).type
         self.memory = memory
         self.global_step = 0
-        self.num_train_envs = self.memory.num_envs
+        self.num_train_envs = self.memory.num_envs if self.memory is not None else 0
 
         # Writer setup
         self.writer = writer
@@ -133,10 +131,10 @@ class PPO:
         self._kl_threshold = self.cfg["kl_threshold"]
         self._learning_rate = self.cfg["learning_rate"]
         self._learning_rate_scheduler = self.cfg["learning_rate_scheduler"]
-        self._value_preprocessor = value_preprocessor
         self._discount_factor = self.cfg["discount_factor"]
         self._lambda = self.cfg["lambda"]
         self._time_limit_bootstrap = self.cfg["time_limit_bootstrap"]
+        self._num_critics = self.cfg.get("num_critics", None)
 
         # Networks
         self.policy = policy
@@ -163,10 +161,12 @@ class PPO:
             if self.encoder.state_preprocessor is not None:
                 self.writer.checkpoint_modules["state_preprocessor"] = self.encoder.state_preprocessor
 
-        if self._value_preprocessor is not None:
-            self.writer.checkpoint_modules["value_preprocessor"] = self._value_preprocessor
-        else:
-            self._value_preprocessor = self._empty_preprocessor
+            if self._num_critics > 1:
+                for i, critic in enumerate(self.value.critics):
+                    if critic.value_preprocessor is not None:
+                        self.writer.checkpoint_modules[f"value_preprocessor_{i}"] = critic.value_preprocessor
+            else:
+                self.writer.checkpoint_modules["value_preprocessor"] = self.value.value_preprocessor
             
         self.num_actions = self.action_space.shape[0]
 
@@ -204,12 +204,12 @@ class PPO:
 
             # Create transition tensors
             self.memory.create_tensor(name="actions", size=self.action_space, dtype=self.dtype)
-            self.memory.create_tensor(name="rewards", size=1, dtype=self.dtype)
+            self.memory.create_tensor(name="rewards", size=self._num_critics, dtype=self.dtype)
+            self.memory.create_tensor(name="values", size=self._num_critics, dtype=self.dtype)
+            self.memory.create_tensor(name="returns", size=self._num_critics, dtype=self.dtype)
             self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=self.dtype)
-            self.memory.create_tensor(name="values", size=1, dtype=self.dtype)
-            self.memory.create_tensor(name="returns", size=1, dtype=self.dtype)
             self.memory.create_tensor(name="advantages", size=1, dtype=self.dtype)
 
             self._tensors_names = self.observation_names + [
@@ -221,6 +221,7 @@ class PPO:
             ]
 
         self._current_next_states = None
+
 
     def record_transition(
         self,
@@ -242,7 +243,8 @@ class PPO:
             states: Current state observations.
             actions: Actions taken by the agent.
             log_prob: Log probabilities of taken actions.
-            rewards: Rewards received.
+            rewards: Rewards received. For multi-critic, shape should be (num_envs, num_critics).
+                     For single critic, shape should be (num_envs, 1) or (num_envs,).
             next_states: Next state observations.
             terminated: Episode termination flags.
             truncated: Episode truncation flags.
@@ -253,14 +255,23 @@ class PPO:
 
         self._current_next_states = next_states
 
+        # Ensure rewards have correct shape
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(-1)
+        
+        # check
+        if self._num_critics != rewards.shape[1]:
+            raise ValueError(
+                f"Expected rewards shape (num_envs, {self._num_critics}) for multi-critic, "
+                f"got {rewards.shape}"
+            )
+
         # Compute value estimates
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
             z = self.encoder(states)
-            values = self.value.compute_value(z)
+            values = self.value.compute_value(z, inverse=True) 
             
             # Inverse preprocess to get raw value estimates
-            values = self._value_preprocessor(values, inverse=True)
-            
 
         # Time-limit bootstrapping: add discounted value to reward at truncation
         if self._time_limit_bootstrap:
@@ -279,6 +290,94 @@ class PPO:
             values=values,
         )
 
+    def compute_gae(self, rewards: torch.Tensor,
+            dones: torch.Tensor,
+            values: torch.Tensor,
+            last_values: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Generalized Advantage Estimation (GAE).
+            
+            Args:
+                rewards: Rewards tensor.
+                dones: Done flags (terminated or truncated).
+                values: Value estimates.
+                last_values: Value estimates for terminal states.
+                discount_factor: Discount factor (gamma).
+                lambda_coefficient: GAE lambda parameter.
+            Returns:
+                Tuple of (returns, advantages).
+            """
+        advantages = torch.zeros_like(rewards)
+        not_dones = dones.logical_not()
+        memory_size = rewards.shape[0]
+        advantage = 0.0
+    
+        # Compute advantages backwards through time
+        for i in reversed(range(memory_size)):
+            next_value = values[i + 1] if i < memory_size - 1 else last_values
+            advantage = (
+                rewards[i]
+                - values[i]
+                + self._discount_factor * not_dones[i] * (next_value + self._lambda * advantage)
+            )
+            advantages[i] = advantage
+            
+        # Compute returns and normalize advantages
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        return returns, advantages
+
+    def compute_multicritic_gae(self, rewards: torch.Tensor,
+            dones: torch.Tensor,
+            values: torch.Tensor,
+            last_values: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            """Compute Generalized Advantage Estimation (GAE) for multi-critic."""
+            
+            num_critics = values.shape[1]
+            all_advantages = []
+            all_returns = []
+            advantages = torch.zeros_like(rewards)
+            memory_size = rewards.shape[0]
+            
+            for critic_idx in range(num_critics):
+                critic_values = values[:, critic_idx:critic_idx+1]
+                critic_rewards = rewards[:, critic_idx:critic_idx+1]
+                critic_last_values = last_values[:, critic_idx:critic_idx+1]
+                
+                advantages = torch.zeros_like(critic_rewards)
+                not_dones = dones.logical_not()
+                advantage = 0.0
+                
+                # Compute advantages backwards through time using this critic's reward
+                for i in reversed(range(memory_size)):
+
+                    next_value = critic_values[i + 1] if i < memory_size - 1 else critic_last_values[env_idx:env_idx+1]
+                    advantage = (
+                        critic_rewards[i]
+                        - critic_values[i]
+                        + self._discount_factor * not_dones[i] * (next_value + self._lambda * advantage)
+                    )
+                    advantages[i] = advantage
+                
+                # Compute returns and normalize advantages for this critic
+                returns = advantages + critic_values
+                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                
+                all_advantages.append(normalized_advantages)
+                all_returns.append(returns)
+                
+                # Stack returns: (memory_size, num_critics)
+                returns = torch.cat(all_returns, dim=-1)
+                # Sum normalized advantages across critics: (memory_size, 1)
+                # Each element in all_advantages is shape (memory_size, 1)
+                advantages = torch.zeros_like(all_advantages[0])
+                for adv in all_advantages:
+                    advantages += adv
+                
+                return returns, advantages
+
     def _update(self) -> bool:
         """Execute PPO update step.
         
@@ -288,54 +387,13 @@ class PPO:
         Returns:
             True if NaN/Inf detected (should prune trial), False otherwise.
         """
-        def compute_gae(
-            rewards: torch.Tensor,
-            dones: torch.Tensor,
-            values: torch.Tensor,
-            last_values: torch.Tensor,
-            discount_factor: float,
-            lambda_coefficient: float,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """Compute Generalized Advantage Estimation (GAE).
-            
-            Args:
-                rewards: Rewards tensor.
-                dones: Done flags (terminated or truncated).
-                values: Value estimates.
-                last_values: Value estimates for terminal states.
-                discount_factor: Discount factor (gamma).
-                lambda_coefficient: GAE lambda parameter.
-                
-            Returns:
-                Tuple of (returns, advantages).
-            """
-            advantages = torch.zeros_like(rewards)
-            not_dones = dones.logical_not()
-            memory_size = rewards.shape[0]
-            advantage = 0.0
 
-            # Compute advantages backwards through time
-            for i in reversed(range(memory_size)):
-                next_value = values[i + 1] if i < memory_size - 1 else last_values
-                advantage = (
-                    rewards[i]
-                    - values[i]
-                    + discount_factor * not_dones[i] * (next_value + lambda_coefficient * advantage)
-                )
-                advantages[i] = advantage
-            
-            # Compute returns and normalize advantages
-            returns = advantages + values
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-            return returns, advantages
 
         # Compute value estimates for terminal states
         with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
             self.value.eval()
             z = self.encoder(self._current_next_states)
-            last_values = self.value.compute_value(z)
-            last_values = self._value_preprocessor(last_values, inverse=True)
+            last_values = self.value.compute_value(z, inverse=True)          
             self.value.train()
 
         # Get stored values and compute GAE
@@ -346,18 +404,26 @@ class PPO:
             | self.memory.get_tensor_by_name("truncated")
         )
 
-        returns, advantages = compute_gae(
-            rewards=rewards,
-            dones=dones,
-            values=values,
-            last_values=last_values,
-            discount_factor=self._discount_factor,
-            lambda_coefficient=self._lambda,
-        )
+        if self._num_critics > 1:
+            returns, advantages = self.compute_multicritic_gae(
+                rewards=rewards,
+                dones=dones,
+                values=values,
+                last_values=last_values,
+            )
+        else:
+            returns, advantages = self.compute_gae(
+                rewards=rewards,
+                dones=dones,
+                values=values,
+                last_values=last_values,
+            )
 
         # Preprocess values and returns for training
-        self.memory.set_tensor_by_name("values", self._value_preprocessor(values, train=True))
-        self.memory.set_tensor_by_name("returns", self._value_preprocessor(returns, train=True))
+        processed_values = self.value.value_preprocessor(values, train=True)
+        processed_returns = self.value.value_preprocessor(returns, train=True)
+        self.memory.set_tensor_by_name("values", processed_values)
+        self.memory.set_tensor_by_name("returns", processed_returns)
         self.memory.set_tensor_by_name("advantages", advantages)
 
         # Sample mini-batches from memory
@@ -411,12 +477,14 @@ class PPO:
                 ) = minibatch
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+
                     sampled_states = {"policy": sampled_states}
 
                     # Retain gradients for log_std parameter
                     self.policy.log_std_parameter.retain_grad()
 
                     # Policy path: compute new action probabilities
+                    # train only for first epoch
                     z_policy = self.encoder(sampled_states, train=not epoch)
                     z_policy.requires_grad_(True)
                     _, next_log_prob, _ = self.policy.act(z_policy, taken_actions=sampled_actions)
@@ -451,15 +519,17 @@ class PPO:
                     z_value.requires_grad_(True)
                     predicted_values = self.value.compute_value(z_value)
 
-                    # Clip value updates for stability
-                    if self._value_clip > 0:
-                        predicted_values = sampled_values + torch.clamp(
-                            predicted_values - sampled_values,
-                            min=-self._value_clip,
-                            max=self._value_clip,
-                        )
-
-                    value_loss = self._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+                    # Clip value updates for stability and compute value loss
+                    if self._num_critics > 1:
+                        value_loss =self.compute_multicritic_loss()
+                    else:
+                        if self._value_clip > 0:
+                            predicted_values = sampled_values + torch.clamp(
+                                predicted_values - sampled_values,
+                                min=-self._value_clip,
+                                max=self._value_clip,
+                            )
+                        value_loss = self._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
 
                     # Compute SSL auxiliary loss if enabled
                     if self.ssl_task is not None and epoch < aux_learning_epochs:
@@ -576,17 +646,31 @@ class PPO:
                         self.tb_writer.add_scalar(k, v, global_step=self.update_step)
 
             # Log value preprocessor statistics
-            if isinstance(self._value_preprocessor, RunningStandardScaler):
-                wandb_dict.update({
-                    "Value scaler / running_mean_mean": self._value_preprocessor.running_mean_mean,
-                    "Value scaler / running_mean_median": self._value_preprocessor.running_mean_median,
-                    "Value scaler / running_mean_min": self._value_preprocessor.running_mean_min,
-                    "Value scaler / running_mean_max": self._value_preprocessor.running_mean_max,
-                    "Value scaler / running_variance_mean": self._value_preprocessor.running_variance_mean,
-                    "Value scaler / running_variance_median": self._value_preprocessor.running_variance_median,
-                    "Value scaler / running_variance_min": self._value_preprocessor.running_variance_min,
-                    "Value scaler / running_variance_max": self._value_preprocessor.running_variance_max,
-                })
+            # if self._num_critics>1:
+            #     for critic in self.value.critics:
+            #         if isinstance(critic.value_preprocessor, RunningStandardScaler):
+            #             wandb_dict.update({
+            #                 f"Value scaler {critic_idx} / running_mean_mean": critic.value_preprocessor.running_mean_mean,
+            #                 f"Value scaler {critic_idx} / running_mean_median": critic.value_preprocessor.running_mean_median,
+            #                 f"Value scaler {critic_idx} / running_mean_min": critic.value_preprocessor.running_mean_min,
+            #                 f"Value scaler {critic_idx} / running_mean_max": critic.value_preprocessor.running_mean_max,
+            #                 f"Value scaler {critic_idx} / running_variance_mean": critic.value_preprocessor.running_variance_mean,
+            #                 f"Value scaler {critic_idx} / running_variance_median": critic.value_preprocessor.running_variance_median,
+            #                 f"Value scaler {critic_idx} / running_variance_min": critic.value_preprocessor.running_variance_min,
+            #                 f"Value scaler {critic_idx} / running_variance_max": critic.value_preprocessor.running_variance_max,
+            #             })
+            # else:
+            #     if isinstance(self._value_preprocessors[0], RunningStandardScaler):
+            #         wandb_dict.update({
+            #             "Value scaler / running_mean_mean": self._value_preprocessors[0].running_mean_mean,
+            #             "Value scaler / running_mean_median": self._value_preprocessors[0].running_mean_median,
+            #             "Value scaler / running_mean_min": self._value_preprocessors[0].running_mean_min,
+            #             "Value scaler / running_mean_max": self._value_preprocessors[0].running_mean_max,
+            #             "Value scaler / running_variance_mean": self._value_preprocessors[0].running_variance_mean,
+            #             "Value scaler / running_variance_median": self._value_preprocessors[0].running_variance_median,
+            #             "Value scaler / running_variance_min": self._value_preprocessors[0].running_variance_min,
+            #             "Value scaler / running_variance_max": self._value_preprocessors[0].running_variance_max,
+            #         })
 
             # Log policy standard deviation
             wandb_dict["Policy / Standard deviation"] = self.policy.distribution().stddev.mean().item()
@@ -602,6 +686,27 @@ class PPO:
         self.encoder.eval()
 
         return False
+
+    def compute_multicritic_loss(self, predicted_values: torch.Tensor, sampled_values: torch.Tensor, sampled_returns: torch.Tensor) -> torch.Tensor:
+        # Compute loss for each critic separately
+        critic_losses = []
+        for critic_idx in range(self._num_critics):
+            critic_predicted = predicted_values[:, critic_idx:critic_idx+1]
+            critic_sampled_values = sampled_values[:, critic_idx:critic_idx+1]
+            critic_sampled_returns = sampled_returns[:, critic_idx:critic_idx+1]
+            
+            if self._value_clip > 0:
+                critic_predicted = critic_sampled_values + torch.clamp(
+                    critic_predicted - critic_sampled_values,
+                    min=-self._value_clip,
+                    max=self._value_clip,
+                )
+            
+            critic_losses.append(F.mse_loss(critic_sampled_returns, critic_predicted))
+        
+        # Sum losses across all critics
+        value_loss = self._value_loss_scale * sum(critic_losses)
+        return value_loss
 
     def _check_instability(self, x, name):
         """Check for NaN/Inf values in tensor (debug mode only).
@@ -642,17 +747,3 @@ class PPO:
                 else:
                     print(f"Warning: Cannot load '{name}' module (not registered)")
 
-    def _empty_preprocessor(self, _input, *args, **kwargs):
-        """Identity preprocessor (no-op).
-        
-        Defined as a method instead of lambda for PyTorch multiprocessing compatibility.
-        
-        Args:
-            _input: Input tensor.
-            *args: Unused positional arguments.
-            **kwargs: Unused keyword arguments.
-            
-        Returns:
-            Input tensor unchanged.
-        """
-        return _input

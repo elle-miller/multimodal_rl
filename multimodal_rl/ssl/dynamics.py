@@ -17,8 +17,8 @@ from copy import deepcopy
 from collections import deque
 
 class ForwardDynamics(AuxiliaryTask):
-    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, value_preprocessor, env, env_cfg, writer):
-        super().__init__(aux_task_cfg, rl_rollout, rl_memory, encoder, value, value_preprocessor, env, env_cfg, writer)
+    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, env, env_cfg, writer):
+        super().__init__(aux_task_cfg, rl_rollout, rl_memory, encoder, value, env, env_cfg, writer)
 
         # sequence length has to be minimum 2 to collect the next state
         assert self.seq_length > 1
@@ -60,7 +60,7 @@ class ForwardDynamics(AuxiliaryTask):
             return [self.encoder, self.forward_model, self.projector]
 
     def create_memory(self):
-        return DynamicsMemory(self.env, self.encoder, self.value, self.value_preprocessor, self.memory_size, self.seq_length)
+        return DynamicsMemory(self.env, self.encoder, self.value, self.memory_size, self.seq_length)
 
     def sample_minibatches(self):
         batch_list = []

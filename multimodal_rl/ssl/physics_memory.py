@@ -9,7 +9,6 @@ class DynamicsMemory:
                  env,
                  encoder,
                  value,
-                 value_preprocessor,
                  memory_size: int,
                  seq_length: int = 1,                
                  device: str = "cuda" if torch.cuda.is_available() else "cpu"):
@@ -29,8 +28,6 @@ class DynamicsMemory:
         """
         self.encoder = encoder
         self.value = value 
-        self.value_preprocessor = value_preprocessor 
-
         self.memory_size = memory_size
         self.seq_length = seq_length
         

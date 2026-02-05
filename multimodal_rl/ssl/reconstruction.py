@@ -47,8 +47,8 @@ class Reconstruction(AuxiliaryTask):
     Aims to force the encoder to learn an information-rich latent representation.
     """
 
-    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, value_preprocessor, env, env_cfg, writer):
-        super().__init__(aux_task_cfg, rl_rollout, rl_memory, encoder, value, value_preprocessor, env, env_cfg, writer)
+    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, env, env_cfg, writer):
+        super().__init__(aux_task_cfg, rl_rollout, rl_memory, encoder, value, env, env_cfg, writer)
 
         self.num_prop_obs = env.observation_space["policy"]["prop"].shape[0]
         self.num_tactile_obs = env.observation_space["policy"]["tactile"].shape[0]

@@ -289,7 +289,9 @@ class Trainer:
                 # Update episode tracker
                 eval_info = None
                 if "log" in infos:
-                    eval_info = {k: v[: self.num_eval_envs] for k, v in infos["log"].items()}
+                    eval_info = {}
+                    for k, v in infos["log"].items():
+                        eval_info[k] = v[: self.num_eval_envs]
                 self.episode_tracker.update(
                     rewards=rewards[: self.num_eval_envs, :],
                     terminated=terminated[: self.num_eval_envs, :],
@@ -374,10 +376,11 @@ class Trainer:
         # Log counter metrics
         if "counters" in infos:
             for k, v in infos["counters"].items():
-                metric_value = v[: self.num_eval_envs].mean().cpu()
-                wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
-                if self.writer.tb_writer is not None:
-                    self.writer.tb_writer.add_scalar(k, metric_value, global_step=self.global_step)
+                if v is not None:
+                    metric_value = v[: self.num_eval_envs].mean().cpu()
+                    wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
+                    if self.writer.tb_writer is not None:
+                        self.writer.tb_writer.add_scalar(k, metric_value, global_step=self.global_step)
 
         # Get episode metrics from tracker
         returns = self.episode_tracker.get_mean_returns()

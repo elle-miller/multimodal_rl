@@ -166,6 +166,7 @@ class Writer:
 
         # Save best model if improved
         if self.checkpoint_best_modules["modules"] and not self.checkpoint_best_modules["saved"]:
+            print(f"Saving best_agent.pt")
             modules = {
                 name: self.checkpoint_best_modules["modules"][name]
                 for name in self.checkpoint_modules.keys()

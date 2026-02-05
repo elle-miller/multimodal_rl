@@ -30,13 +30,12 @@ class AuxiliaryTask(ABC):
         rl_memory: RL memory buffer (may be shared with SSL task).
         encoder: Shared encoder network.
         value: Value network (unused but kept for compatibility).
-        value_preprocessor: Value preprocessor (unused but kept for compatibility).
         env: Training environment.
         env_cfg: Environment configuration.
         writer: Writer for logging.
     """
 
-    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, value_preprocessor, env, env_cfg, writer):
+    def __init__(self, aux_task_cfg, rl_rollout, rl_memory, encoder, value, env, env_cfg, writer):
         # Hyperparameters
         self.aux_loss_weight = aux_task_cfg["loss_weight"]
         self.lr = aux_task_cfg["learning_rate"]
@@ -69,7 +68,6 @@ class AuxiliaryTask(ABC):
         # Networks (shared with RL)
         self.encoder = encoder
         self.value = value
-        self.value_preprocessor = value_preprocessor
         self.z_dim = self.encoder.num_outputs
         self.action_dim = self.env.action_space.shape[0]
         self.augmentations = None

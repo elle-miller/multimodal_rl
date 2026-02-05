@@ -3,12 +3,16 @@
 Provides Gaussian policy (stochastic) and deterministic value function networks.
 """
 
+import itertools
+
 import gym
 import gymnasium
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Any, List, Mapping, Optional, Tuple, Union
+from multimodal_rl.models.running_standard_scaler import RunningStandardScaler
+
 
 from multimodal_rl.models.mlp import MLP
 
@@ -222,6 +226,7 @@ class DeterministicValue(torch.nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         hiddens: list = [256, 128, 64],
         activations: list = ["elu", "elu", "elu", "identity"],
+        scale_values: bool = True,
     ):
         super().__init__()
 
@@ -233,7 +238,15 @@ class DeterministicValue(torch.nn.Module):
         hiddens.append(1)  # Output is scalar value
         self.value_net = MLP(z_dim, hiddens, activations).to(device)
 
-    def compute_value(self, z) -> torch.Tensor:
+        # Initialize state preprocessor if specified
+        if scale_values:
+            self.value_preprocessor = RunningStandardScaler(size=1, device=device)
+        else:
+            self.value_preprocessor = self.empty_preprocessor
+
+
+
+    def compute_value(self, z, inverse=False) -> torch.Tensor:
         """Compute value estimate from latent representation.
         
         Args:
@@ -242,4 +255,59 @@ class DeterministicValue(torch.nn.Module):
         Returns:
             Value estimates of shape (batch_size, 1).
         """
-        return self.value_net(z)
+        if inverse:
+            return self.value_preprocessor(self.value_net(z), inverse=True)
+        else:
+            return self.value_net(z)
+
+    def empty_preprocessor(self, x, train=False, inverse=False):
+        return x
+
+
+class MultiCritic(torch.nn.Module):
+    """Wrapper for multiple value function networks (critics).
+    
+    Manages multiple critics and computes value estimates from each.
+    Used for multi-critic PPO where advantages are computed separately
+    for each critic and then combined.
+    
+    Args:
+        critics: List of DeterministicValue networks.
+    """
+    
+    def __init__(self, critics: List[DeterministicValue]):
+        super().__init__()
+        if not isinstance(critics, list):
+            raise ValueError("critics must be a list of DeterministicValue networks")
+        if len(critics) == 0:
+            raise ValueError("critics list cannot be empty")
+        
+        self.critics = torch.nn.ModuleList(critics)
+        self.num_critics = len(critics)
+        self.device = critics[0].device
+        
+    def compute_value(self, z, inverse=False) -> torch.Tensor:
+        """Compute value estimates from all critics.
+        
+        Args:
+            z: Latent representation tensor of shape (batch_size, z_dim).
+            
+        Returns:
+            Value estimates of shape (batch_size, num_critics).
+            Each column corresponds to one critic's value estimate.
+        """
+        values = []
+        for critic in self.critics:
+            value = critic.compute_value(z, inverse=inverse)  # Shape: (batch_size, 1)
+            values.append(value)
+        # Stack along last dimension: (batch_size, num_critics)
+        return torch.cat(values, dim=-1)
+
+    def value_preprocessor(self, values, train=False, inverse=False):
+        proccessed_values = []
+        for critic in self.critics:
+            proccessed_values.append(critic.value_preprocessor(values, train=train, inverse=inverse))
+        return torch.cat(proccessed_values, dim=-1)
+
+    def parameters(self):
+        return itertools.chain(*[critic.parameters() for critic in self.critics])
