@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.distributions import Normal
 from typing import Any, List, Mapping, Optional, Tuple, Union
 from multimodal_rl.models.running_standard_scaler import RunningStandardScaler
-
+import numpy as np
 
 from multimodal_rl.models.mlp import MLP
 
@@ -22,6 +22,13 @@ _ACTIVATIONS = {
     "identity": nn.Identity(),
 }
 
+def init_ppo_weights(module, std=np.sqrt(2), bias_const=0.0):
+    """
+    Standard PPO initialization for Linear layers.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.orthogonal_(module.weight, gain=std)
+        nn.init.constant_(module.bias, bias_const)
 
 class GaussianPolicy(torch.nn.Module):
     """Gaussian policy network for continuous action spaces.
@@ -43,6 +50,8 @@ class GaussianPolicy(torch.nn.Module):
         activations: List of activation function names (default: ["elu", "elu", "elu", "tanh"]).
         reduction: How to reduce log probability across action dimensions:
             "sum", "mean", "prod", or "none" (default: "sum").
+        state_dependent_log_std: If True, log_std is computed from state via a head;
+            if False, uses a learnable parameter (default: False).
     """
 
     def __init__(
@@ -59,6 +68,7 @@ class GaussianPolicy(torch.nn.Module):
         hiddens: list = [256, 128, 64],
         activations: list = ["elu", "elu", "elu", "tanh"],
         reduction: str = "sum",
+        state_dependent_log_std: bool = False,
     ) -> None:
         super().__init__()
 
@@ -67,20 +77,39 @@ class GaussianPolicy(torch.nn.Module):
         )
         self.observation_space = observation_space
         self.action_space = action_space
+        self._state_dependent_log_std = state_dependent_log_std
 
         num_actions = action_space.shape[0]
-        self.log_std_parameter = nn.Parameter(
-            initial_log_std * torch.ones(num_actions, device=device),
-            requires_grad=True
-        )
 
         # Build policy network
-        if not hiddens:
-            self.policy_net = nn.Sequential(nn.Linear(z_dim, num_actions), _ACTIVATIONS[activations[-1]])
+        hiddens = hiddens.copy()
+        self.policy_net = MLP(z_dim, hiddens, activations[:-1]).to(device)
+
+        # Mean head: Gain 0.01 for exploration
+        self.mean_head = nn.Sequential(
+            nn.Linear(hiddens[-1], num_actions),
+            _ACTIVATIONS[activations[-1]] # Only add this if your actions are strictly [-1, 1]
+        ).to(device)
+        
+        # Initialize log_std: either as parameter or network head
+        if state_dependent_log_std:
+            self.log_std_head = nn.Linear(hiddens[-1], num_actions).to(device)
         else:
-            hiddens = hiddens.copy()
-            hiddens.append(num_actions)
-            self.policy_net = MLP(z_dim, hiddens, activations).to(device)
+            # Use learnable parameter
+            self.log_std_parameter = nn.Parameter(
+                initial_log_std * torch.ones(num_actions, device=device),
+                requires_grad=True
+            )
+
+        # orthogonal initialization with gain 0.01 for the last layer
+        self.policy_net.apply(init_ppo_weights)
+        for layer in self.mean_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=0.01)
+                nn.init.constant_(layer.bias, 0.0)
+        if state_dependent_log_std:
+            nn.init.orthogonal_(self.log_std_head.weight, gain=0.01)
+            nn.init.constant_(self.log_std_head.bias, 0.0)
 
         # Action clipping setup
         self._clip_actions = clip_actions and (
@@ -132,14 +161,22 @@ class GaussianPolicy(torch.nn.Module):
             >>> print(actions.shape, log_prob.shape)
             torch.Size([32, 8]) torch.Size([32, 1])
         """
-        mean_actions = self.policy_net(z)
+        x = self.policy_net(z)
+        mean_actions = self.mean_head(x)
+        
         outputs = {}
 
         if deterministic:
             return mean_actions, None, outputs
 
         # Get and optionally clip log standard deviation
-        log_std = self.log_std_parameter
+        if self._state_dependent_log_std:
+            log_std = self.log_std_head(x)
+        else:
+            # Use learnable parameter and expand to match batch size
+            batch_size = mean_actions.shape[0]
+            log_std = self.log_std_parameter.unsqueeze(0).expand(batch_size, -1)  # Shape: (batch_size, num_actions)
+        
         if self._clip_log_std:
             log_std = torch.clamp(log_std, self._log_std_min, self._log_std_max)
 
@@ -181,16 +218,7 @@ class GaussianPolicy(torch.nn.Module):
             return torch.tensor(0.0, device=self.device)
         return self._distribution.entropy().to(self.device)
 
-    def get_log_std(self, role: str = "") -> torch.Tensor:
-        """Get log standard deviation for current batch.
-        
-        Args:
-            role: Unused, kept for API compatibility.
-            
-        Returns:
-            Log standard deviation tensor of shape (batch_size, num_actions).
-        """
-        return self._log_std.repeat(self._num_samples, 1)
+
 
     def distribution(self, role: str = "") -> torch.distributions.Normal:
         """Get the current action distribution.
@@ -244,6 +272,15 @@ class DeterministicValue(torch.nn.Module):
         else:
             self.value_preprocessor = self.empty_preprocessor
 
+        # 1. Initialize hidden layers with standard gain (sqrt(2) for ReLU/Tanh)
+        self.value_net.apply(init_ppo_weights)
+
+        # 2. Overwrite the final layer to use a gain of 1.0 (for the Critic)
+        final_layer = list(self.value_net.modules())[-1] 
+        if isinstance(final_layer, nn.Linear):
+            nn.init.orthogonal_(final_layer.weight, gain=1.0)
+            nn.init.constant_(final_layer.bias, 0.0)
+
 
 
     def compute_value(self, z, inverse=False) -> torch.Tensor:
@@ -277,11 +314,8 @@ class MultiCritic(torch.nn.Module):
     
     def __init__(self, critics: List[DeterministicValue]):
         super().__init__()
-        if not isinstance(critics, list):
-            raise ValueError("critics must be a list of DeterministicValue networks")
-        if len(critics) == 0:
-            raise ValueError("critics list cannot be empty")
-        
+
+       
         self.critics = torch.nn.ModuleList(critics)
         self.num_critics = len(critics)
         self.device = critics[0].device
@@ -305,8 +339,8 @@ class MultiCritic(torch.nn.Module):
 
     def value_preprocessor(self, values, train=False, inverse=False):
         proccessed_values = []
-        for critic in self.critics:
-            proccessed_values.append(critic.value_preprocessor(values, train=train, inverse=inverse))
+        for i, critic in enumerate(self.critics):
+            proccessed_values.append(critic.value_preprocessor(values[:, :, i].unsqueeze(-1), train=train, inverse=inverse))
         return torch.cat(proccessed_values, dim=-1)
 
     def parameters(self):

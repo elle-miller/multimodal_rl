@@ -61,6 +61,8 @@ class EpisodeTracker:
         self.active_mask *= (1 - done.float())
         
         # Accumulate returns (masked and unmasked)
+        rewards = rewards if rewards.dim() == 1 else rewards.sum(dim=-1, keepdim=True)
+
         self.unmasked_returns += rewards
         self.returns += rewards * self.active_mask
         
@@ -267,7 +269,6 @@ class Trainer:
                 # Training: use live policy
                 train_z = self.encoder(train_states)
                 train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
-
 
                 # Combine actions from eval and training environments
                 actions[: self.num_eval_envs] = eval_actions.detach()

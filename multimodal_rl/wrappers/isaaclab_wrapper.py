@@ -76,6 +76,10 @@ class IsaacLabWrapper(object):
         """
         self._observations, reward, terminated, truncated, self._info = self._env.step(actions)
 
+        # ensure reward is 2D
+        if reward.dim() == 1:
+            reward = reward.view(-1, 1)
+
         if self.debug:
             for k, v in self._observations["policy"].items():
                 # actviate the LazyFrame
@@ -83,7 +87,7 @@ class IsaacLabWrapper(object):
             self._check_instability(actions, "actions")
             self._check_instability(reward, "reward")
 
-        return self._observations, reward.view(-1, 1), terminated.view(-1, 1), truncated.view(-1, 1), self._info
+        return self._observations, reward, terminated.view(-1, 1), truncated.view(-1, 1), self._info
 
     def reset(self, hard=False) -> Tuple[torch.Tensor, Any]:
         """Reset the environmentc

@@ -16,8 +16,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, Union
-
+from multimodal_rl.rl.pcgrad import PCGrad
 from multimodal_rl.rl.memories import Memory
+from multimodal_rl.rl.kl_adaptive_scheduler import KLAdaptiveLR
 
 PPO_DEFAULT_CONFIG = {
     "rollouts": 16,
@@ -40,7 +41,8 @@ PPO_DEFAULT_CONFIG = {
     "value_loss_scale": 1.0,
     "kl_threshold": 0,
     "time_limit_bootstrap": False,
-    "num_critics": None,  # If None, auto-detect from reward shape. If > 1, automatically create MultiCritic.
+    "multi_critic": None,  # Dict with keys: num_critics, gammas, weights, names. If None, single critic.
+    "state_dependent_log_std": False,  # If True, log_std is computed from state; if False, uses learnable parameter
     "experiment": {
         "directory": "",
         "experiment_name": "",
@@ -103,7 +105,6 @@ class PPO:
             if device is None else torch.device(device)
         )
         self.dtype = dtype
-        self._device_type = torch.device(self.device).type
         self.memory = memory
         self.global_step = 0
         self.num_train_envs = self.memory.num_envs if self.memory is not None else 0
@@ -134,7 +135,29 @@ class PPO:
         self._discount_factor = self.cfg["discount_factor"]
         self._lambda = self.cfg["lambda"]
         self._time_limit_bootstrap = self.cfg["time_limit_bootstrap"]
-        self._num_critics = self.cfg.get("num_critics", None)
+
+        # Multi-critic configuration
+        multi_critic_cfg = self.cfg.get("multi_critic", None)
+        if multi_critic_cfg:
+            self._num_critics = multi_critic_cfg["num_critics"]
+            self._gammas = multi_critic_cfg["gammas"]
+            self._critic_weights = torch.tensor(multi_critic_cfg["weights"], device=self.device, dtype=self.dtype)
+            self._critic_names = multi_critic_cfg["names"]
+            # Validate lengths
+            assert len(self._gammas) == self._num_critics, \
+                f"gammas length ({len(self._gammas)}) must match num_critics ({self._num_critics})"
+            assert len(self._critic_weights) == self._num_critics, \
+                f"weights length ({len(multi_critic_cfg['weights'])}) must match num_critics ({self._num_critics})"
+            assert len(self._critic_names) == self._num_critics, \
+                f"names length ({len(self._critic_names)}) must match num_critics ({self._num_critics})"
+        else:
+            self._num_critics = 1
+            self._gammas = [self._discount_factor]
+            self._critic_weights = torch.ones(1, device=self.device, dtype=self.dtype)
+            self._critic_names = ["default"]
+
+        # Check if policy uses state-dependent log_std (from config or by inspecting policy)
+        self._state_dependent_log_std = self.cfg.get("state_dependent_log_std", False)
 
         # Networks
         self.policy = policy
@@ -145,9 +168,10 @@ class PPO:
         self.encoder.eval()
 
         # Separate optimizers for each network component
-        self.policy_optimiser = torch.optim.Adam(self.policy.parameters(), lr=self._learning_rate)
-        self.value_optimiser = torch.optim.Adam(self.value.parameters(), lr=self._learning_rate)
-        self.encoder_optimiser = torch.optim.Adam(self.encoder.parameters(), lr=self._learning_rate)
+        adam_epsilon = 1e-5
+        self.policy_optimiser = torch.optim.Adam(self.policy.parameters(), lr=self._learning_rate, eps=adam_epsilon)
+        self.value_optimiser = torch.optim.Adam(self.value.parameters(), lr=self._learning_rate, eps=adam_epsilon)
+        self.encoder_optimiser = torch.optim.Adam(self.encoder.parameters(), lr=self._learning_rate, eps=adam_epsilon)
 
         # Register modules for checkpointing
         if self.writer is not None:
@@ -170,17 +194,62 @@ class PPO:
             
         self.num_actions = self.action_space.shape[0]
 
-        # Learning rate scheduler (if specified)
+        # Learning rate schedulers (if specified)
+        # Can create separate schedulers for each optimizer or use the same scheduler for all
+        self._learning_rate_schedulers = {}
+        scheduler_kwargs = self.cfg.get("learning_rate_scheduler_kwargs", {})
+        
         if self._learning_rate_scheduler is not None:
-            # Note: scheduler would need a combined optimizer, currently not implemented
-            pass
+            scheduler_name_or_class = self._learning_rate_scheduler
+            
+            # Check if it's KLAdaptiveLR (string or class)
+            is_kl_adaptive = (
+                scheduler_name_or_class == "KLAdaptiveLR" or
+                (isinstance(scheduler_name_or_class, type) and issubclass(scheduler_name_or_class, KLAdaptiveLR))
+            )
+            policy_optim = self.policy_optimiser
+            
+            if is_kl_adaptive:
+                # KLAdaptiveLR needs KL divergence, typically only applied to policy
+                # Filter out apply_to_all from kwargs before passing to KLAdaptiveLR
+                filtered_kwargs = {k: v for k, v in scheduler_kwargs.items() if k != "apply_to_all"}
+                self._learning_rate_schedulers["policy"] = KLAdaptiveLR(
+                    policy_optim,
+                    **filtered_kwargs
+                )
+                # Optionally apply same learning rate to other optimizers
+                if scheduler_kwargs.get("apply_to_all", False):
+                    self._learning_rate_schedulers["value"] = KLAdaptiveLR(
+                        self.value_optimiser,
+                        **filtered_kwargs
+                    )
+                    self._learning_rate_schedulers["encoder"] = KLAdaptiveLR(
+                        self.encoder_optimiser,
+                        **filtered_kwargs
+                    )
+            else:
+                # Standard PyTorch scheduler - apply to all optimizers
+                scheduler_class = scheduler_name_or_class
+                if isinstance(scheduler_class, str):
+                    # Import from torch.optim.lr_scheduler
+                    import torch.optim.lr_scheduler as lr_scheduler
+                    scheduler_class = getattr(lr_scheduler, scheduler_class)
+                
+                self._learning_rate_schedulers["policy"] = scheduler_class(
+                    policy_optim,
+                    **scheduler_kwargs
+                )
+                self._learning_rate_schedulers["value"] = scheduler_class(
+                    self.value_optimiser,
+                    **scheduler_kwargs
+                )
+                self._learning_rate_schedulers["encoder"] = scheduler_class(
+                    self.encoder_optimiser,
+                    **scheduler_kwargs
+                )
 
         self.update_step = 0
         self.epoch_step = 0
-
-        # Mixed precision training (disabled due to numerical instabilities)
-        self._mixed_precision = False
-        self.scaler = torch.amp.GradScaler(device=self._device_type, enabled=self._mixed_precision)
 
         # Initialize memory tensors
         if self.memory is not None:
@@ -210,7 +279,7 @@ class PPO:
             self.memory.create_tensor(name="terminated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=self.dtype)
-            self.memory.create_tensor(name="advantages", size=1, dtype=self.dtype)
+            self.memory.create_tensor(name="advantages", size=self._num_critics, dtype=self.dtype)
 
             self._tensors_names = self.observation_names + [
                 "actions",
@@ -266,16 +335,18 @@ class PPO:
                 f"got {rewards.shape}"
             )
 
-        # Compute value estimates
-        with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+        # Compute value estimates (no gradients needed during rollout collection)
+        with torch.no_grad():
             z = self.encoder(states)
-            values = self.value.compute_value(z, inverse=True) 
-            
-            # Inverse preprocess to get raw value estimates
+            values = self.value.compute_value(z, inverse=True)
 
         # Time-limit bootstrapping: add discounted value to reward at truncation
         if self._time_limit_bootstrap:
-            rewards += self._discount_factor * values * truncated
+            if self._num_critics > 1:
+                gammas = torch.tensor(self._gammas, device=self.device, dtype=self.dtype)
+                rewards += gammas * values * truncated
+            else:
+                rewards += self._discount_factor * values * truncated
 
         # Store transition in memory
         self.memory.add_samples(
@@ -294,6 +365,8 @@ class PPO:
             dones: torch.Tensor,
             values: torch.Tensor,
             last_values: torch.Tensor,
+            gamma: float = 0.99,
+            lambda_coefficient: float = 0.95,
         ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute Generalized Advantage Estimation (GAE).
             
@@ -318,7 +391,7 @@ class PPO:
             advantage = (
                 rewards[i]
                 - values[i]
-                + self._discount_factor * not_dones[i] * (next_value + self._lambda * advantage)
+                + gamma * not_dones[i] * (next_value + lambda_coefficient * advantage)
             )
             advantages[i] = advantage
             
@@ -328,55 +401,6 @@ class PPO:
 
         return returns, advantages
 
-    def compute_multicritic_gae(self, rewards: torch.Tensor,
-            dones: torch.Tensor,
-            values: torch.Tensor,
-            last_values: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """Compute Generalized Advantage Estimation (GAE) for multi-critic."""
-            
-            num_critics = values.shape[1]
-            all_advantages = []
-            all_returns = []
-            advantages = torch.zeros_like(rewards)
-            memory_size = rewards.shape[0]
-            
-            for critic_idx in range(num_critics):
-                critic_values = values[:, critic_idx:critic_idx+1]
-                critic_rewards = rewards[:, critic_idx:critic_idx+1]
-                critic_last_values = last_values[:, critic_idx:critic_idx+1]
-                
-                advantages = torch.zeros_like(critic_rewards)
-                not_dones = dones.logical_not()
-                advantage = 0.0
-                
-                # Compute advantages backwards through time using this critic's reward
-                for i in reversed(range(memory_size)):
-
-                    next_value = critic_values[i + 1] if i < memory_size - 1 else critic_last_values[env_idx:env_idx+1]
-                    advantage = (
-                        critic_rewards[i]
-                        - critic_values[i]
-                        + self._discount_factor * not_dones[i] * (next_value + self._lambda * advantage)
-                    )
-                    advantages[i] = advantage
-                
-                # Compute returns and normalize advantages for this critic
-                returns = advantages + critic_values
-                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
-                all_advantages.append(normalized_advantages)
-                all_returns.append(returns)
-                
-                # Stack returns: (memory_size, num_critics)
-                returns = torch.cat(all_returns, dim=-1)
-                # Sum normalized advantages across critics: (memory_size, 1)
-                # Each element in all_advantages is shape (memory_size, 1)
-                advantages = torch.zeros_like(all_advantages[0])
-                for adv in all_advantages:
-                    advantages += adv
-                
-                return returns, advantages
 
     def _update(self) -> bool:
         """Execute PPO update step.
@@ -389,14 +413,14 @@ class PPO:
         """
 
 
-        # Compute value estimates for terminal states
-        with torch.no_grad(), torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+        # Compute value estimates for terminal states: size (num_envs, num_critics)
+        with torch.no_grad():
             self.value.eval()
             z = self.encoder(self._current_next_states)
             last_values = self.value.compute_value(z, inverse=True)          
             self.value.train()
 
-        # Get stored values and compute GAE
+        # Get stored values and compute GAE - size (rollout, num_envs, num_critics)
         values = self.memory.get_tensor_by_name("values")
         rewards = self.memory.get_tensor_by_name("rewards")
         dones = (
@@ -405,18 +429,34 @@ class PPO:
         )
 
         if self._num_critics > 1:
-            returns, advantages = self.compute_multicritic_gae(
-                rewards=rewards,
-                dones=dones,
-                values=values,
-                last_values=last_values,
-            )
+            all_returns = []
+            all_advantages = []
+            for i in range(self._num_critics):
+                rewards_i = rewards[:, :, i].unsqueeze(-1)
+                values_i = values[:, :, i].unsqueeze(-1)
+                last_values_i = last_values[:, i].unsqueeze(-1)
+                critic_returns, critic_advantages = self.compute_gae(
+                    rewards=rewards_i,
+                    dones=dones,
+                    values=values_i,
+                    last_values=last_values_i,
+                    gamma=self._gammas[i],
+                    lambda_coefficient=self._lambda,
+                )
+                all_returns.append(critic_returns)
+                all_advantages.append(critic_advantages)
+            
+            returns = torch.cat(all_returns, dim=-1) # size: (rollout, num_envs, num_critics)
+            advantages = torch.cat(all_advantages, dim=-1) # size: (rollout, num_envs, num_critics)
+
         else:
             returns, advantages = self.compute_gae(
                 rewards=rewards,
                 dones=dones,
                 values=values,
                 last_values=last_values,
+                gamma=self._discount_factor,
+                lambda_coefficient=self._lambda,
             )
 
         # Preprocess values and returns for training
@@ -476,71 +516,81 @@ class PPO:
                     sampled_advantages,
                 ) = minibatch
 
-                with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
+                sampled_states = {"policy": sampled_states}
 
-                    sampled_states = {"policy": sampled_states}
-
-                    # Retain gradients for log_std parameter
+                # Retain gradients for log_std parameter (only if not state-dependent)
+                if not self._state_dependent_log_std and hasattr(self.policy, 'log_std_parameter') and self.policy.log_std_parameter.requires_grad:
                     self.policy.log_std_parameter.retain_grad()
 
-                    # Policy path: compute new action probabilities
-                    # train only for first epoch
-                    z_policy = self.encoder(sampled_states, train=not epoch)
-                    z_policy.requires_grad_(True)
-                    _, next_log_prob, _ = self.policy.act(z_policy, taken_actions=sampled_actions)
+                # Policy path: compute new action probabilities
+                # train only for first epoch
+                z_policy = self.encoder(sampled_states, train=not epoch)
+                z_policy.requires_grad_(True)
+                _, next_log_prob, _ = self.policy.act(z_policy, taken_actions=sampled_actions)
                 
-                    # Compute approximate KL divergence for early stopping
-                    with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
-                        kl_divergences.append(kl_divergence)
+                # Compute approximate KL divergence for early stopping
+                with torch.no_grad():
+                    ratio = next_log_prob - sampled_log_prob
+                    kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                    kl_divergences.append(kl_divergence)
 
-                    # Early stopping if KL divergence exceeds threshold
-                    if self._kl_threshold > 0 and kl_divergence > self._kl_threshold:
-                        break
+                # Early stopping if KL divergence exceeds threshold
+                if self._kl_threshold > 0 and kl_divergence > self._kl_threshold:
+                    break
 
-                    # Compute entropy loss
-                    entropy_loss = (
-                        -self._entropy_loss_scale * self.policy.get_entropy().mean()
-                        if self._entropy_loss_scale > 0
-                        else torch.tensor(0.0, device=self.device)
+                # Compute entropy loss
+                entropy_loss = (
+                    -self._entropy_loss_scale * self.policy.get_entropy().mean()
+                    if self._entropy_loss_scale > 0
+                    else torch.tensor(0.0, device=self.device)
+                )
+
+                # Recompute ratio WITH gradients for policy optimization
+                ratio = torch.exp(next_log_prob - sampled_log_prob)
+
+                # Compute per-critic clipped policy losses
+                if self._num_critics > 1:
+                    advantages = (sampled_advantages * self._critic_weights).sum(dim=-1, keepdim=True)
+                else:
+                    advantages = sampled_advantages
+                surr = advantages * ratio
+                surr_clipped = advantages * torch.clamp(
+                    ratio, 1.0 - self._ratio_clip, 1.0 + self._ratio_clip
+                )
+                policy_loss = -torch.min(surr, surr_clipped).mean() 
+
+                # Value path: compute value predictions
+                z_value = self.encoder(sampled_states)
+                z_value.requires_grad_(True)
+                predicted_values = self.value.compute_value(z_value)
+                if self._value_clip > 0:
+                    predicted_values = sampled_values + torch.clamp(
+                        predicted_values - sampled_values,
+                        min=-self._value_clip,
+                        max=self._value_clip,
                     )
 
-                    # Compute clipped policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clamp(
-                        ratio, 1.0 - self._ratio_clip, 1.0 + self._ratio_clip
-                    )
-                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-
-                    # Value path: compute value predictions
-                    z_value = self.encoder(sampled_states)
-                    z_value.requires_grad_(True)
-                    predicted_values = self.value.compute_value(z_value)
-
-                    # Clip value updates for stability and compute value loss
-                    if self._num_critics > 1:
-                        value_loss =self.compute_multicritic_loss()
-                    else:
-                        if self._value_clip > 0:
-                            predicted_values = sampled_values + torch.clamp(
-                                predicted_values - sampled_values,
-                                min=-self._value_clip,
-                                max=self._value_clip,
-                            )
-                        value_loss = self._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
-
-                    # Compute SSL auxiliary loss if enabled
-                    if self.ssl_task is not None and epoch < aux_learning_epochs:
-                        aux_minibatch_full = sampled_aux_batches[i]
-                        aux_minibatch = (aux_minibatch_full[0], aux_minibatch_full[1])
-                        aux_loss, aux_info = self.ssl_task.compute_loss(aux_minibatch)
-                        aux_loss *= self.ssl_task.aux_loss_weight
-                        loss = policy_loss + entropy_loss + value_loss + aux_loss
-                    else:
-                        loss = policy_loss + entropy_loss + value_loss
-                        aux_info = {}
+                if self._num_critics > 1:
+                    value_losses = []
+                    for i in range(self._num_critics):
+                        predicted_values_i = predicted_values[:, i]
+                        sampled_returns_i = sampled_returns[:, i]
+                        value_loss = self._value_loss_scale * F.mse_loss(sampled_returns_i, predicted_values_i)
+                        value_losses.append(value_loss)
+                    value_loss = sum(value_losses) / self._num_critics
+                else:
+                    value_loss = self._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+                
+                # Compute SSL auxiliary loss if enabled
+                if self.ssl_task is not None and epoch < aux_learning_epochs:
+                    aux_minibatch_full = sampled_aux_batches[i]
+                    aux_minibatch = (aux_minibatch_full[0], aux_minibatch_full[1])
+                    aux_loss, aux_info = self.ssl_task.compute_loss(aux_minibatch)
+                    aux_loss *= self.ssl_task.aux_loss_weight
+                    loss = policy_loss + entropy_loss + value_loss + aux_loss
+                else:
+                    loss = policy_loss + entropy_loss + value_loss
+                    aux_info = {}
 
                 # Optimization step
                 self.encoder_optimiser.zero_grad()
@@ -550,29 +600,26 @@ class PPO:
                     self.ssl_task.optimiser.zero_grad()
 
                 # Check for numerical instability
-                if torch.isnan(loss).any() or torch.isinf(loss).any():
-                    print(f"NaN/Inf detected in loss at epoch {epoch}, minibatch {i}")
-                    self._check_instability(policy_loss, "policy_loss")
-                    self._check_instability(value_loss, "value_loss")
-                    self._check_instability(predicted_values, "predicted_values")
-                    self._check_instability(sampled_actions, "sampled_actions")
-                    self._check_instability(sampled_states["policy"].get("prop"), "prop")
-                    self._check_instability(sampled_values, "sampled_values")
-                    self._check_instability(sampled_returns, "sampled_returns")
-                    self._check_instability(sampled_log_prob, "sampled_log_prob")
-                    self._check_instability(sampled_advantages, "sampled_advantages")
-                    if self.wandb_session is not None:
-                        self.wandb_session.finish()
-                    return True
+                # if torch.isnan(loss).any() or torch.isinf(loss).any():
+                #     print(f"NaN/Inf detected in loss at epoch {epoch}, minibatch {i}")
+                #     self._check_instability(policy_loss, "policy_loss")
+                #     self._check_instability(value_loss, "value_loss")
+                #     self._check_instability(predicted_values, "predicted_values")
+                #     self._check_instability(sampled_actions, "sampled_actions")
+                #     self._check_instability(sampled_states["policy"].get("prop"), "prop")
+                #     self._check_instability(sampled_values, "sampled_values")
+                #     self._check_instability(sampled_returns, "sampled_returns")
+                #     self._check_instability(sampled_log_prob, "sampled_log_prob")
+                #     self._check_instability(sampled_advantages, "sampled_advantages")
+                #     if self.wandb_session is not None:
+                #         self.wandb_session.finish()
+                #     return True
 
-                # Backward pass with gradient scaling
-                self.scaler.scale(loss).backward()
+                # Backward pass
+                loss.backward()
 
                 # Gradient clipping
                 if self._grad_norm_clip > 0:
-                    self.scaler.unscale_(self.encoder_optimiser)
-                    self.scaler.unscale_(self.policy_optimiser)
-                    self.scaler.unscale_(self.value_optimiser)
                     nn.utils.clip_grad_norm_(
                         itertools.chain(
                             self.policy.parameters(),
@@ -583,12 +630,11 @@ class PPO:
                     )
 
                 # Update parameters
-                self.scaler.step(self.encoder_optimiser)
-                self.scaler.step(self.policy_optimiser)
-                self.scaler.step(self.value_optimiser)
+                self.encoder_optimiser.step()
+                self.policy_optimiser.step()
+                self.value_optimiser.step()
                 if self.ssl_task is not None:
-                    self.scaler.step(self.ssl_task.optimiser)
-                self.scaler.update()
+                    self.ssl_task.optimiser.step()
 
                 # Accumulate losses
                 epoch_policy_loss += policy_loss.item()
@@ -600,10 +646,17 @@ class PPO:
                 if self._entropy_loss_scale > 0:
                     cumulative_entropy_loss += entropy_loss.item()
 
-            # Update learning rate scheduler if specified
-            if self._learning_rate_scheduler is not None:
-                # Note: scheduler would need combined optimizer
-                pass
+            # Update learning rate schedulers if specified
+            if self._learning_rate_schedulers:
+                avg_kl = torch.tensor(kl_divergences, device=self.device).mean() if kl_divergences else None
+                
+                for name, scheduler in self._learning_rate_schedulers.items():
+                    if isinstance(scheduler, KLAdaptiveLR):
+                        if avg_kl is not None:
+                            scheduler.step(avg_kl.item())
+                    else:
+                        # Standard PyTorch scheduler
+                        scheduler.step()
 
             self.epoch_step += 1
             cumulative_policy_loss += epoch_policy_loss
@@ -623,6 +676,9 @@ class PPO:
             if self.tb_writer is not None:
                 self.tb_writer.add_scalar("policy_loss", wandb_dict["Loss / Policy loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("value_loss", wandb_dict["Loss / Value loss"], global_step=self.global_step)
+                self.tb_writer.add_scalar("learning_rate/policy", self.policy_optimiser.param_groups[0]["lr"], global_step=self.update_step)
+                self.tb_writer.add_scalar("learning_rate/value", self.value_optimiser.param_groups[0]["lr"], global_step=self.update_step)
+                self.tb_writer.add_scalar("learning_rate/encoder", self.encoder_optimiser.param_groups[0]["lr"], global_step=self.update_step)
 
             # Log SSL task metrics
             if self.ssl_task is not None:
@@ -646,34 +702,37 @@ class PPO:
                         self.tb_writer.add_scalar(k, v, global_step=self.update_step)
 
             # Log value preprocessor statistics
-            # if self._num_critics>1:
-            #     for critic in self.value.critics:
-            #         if isinstance(critic.value_preprocessor, RunningStandardScaler):
-            #             wandb_dict.update({
-            #                 f"Value scaler {critic_idx} / running_mean_mean": critic.value_preprocessor.running_mean_mean,
-            #                 f"Value scaler {critic_idx} / running_mean_median": critic.value_preprocessor.running_mean_median,
-            #                 f"Value scaler {critic_idx} / running_mean_min": critic.value_preprocessor.running_mean_min,
-            #                 f"Value scaler {critic_idx} / running_mean_max": critic.value_preprocessor.running_mean_max,
-            #                 f"Value scaler {critic_idx} / running_variance_mean": critic.value_preprocessor.running_variance_mean,
-            #                 f"Value scaler {critic_idx} / running_variance_median": critic.value_preprocessor.running_variance_median,
-            #                 f"Value scaler {critic_idx} / running_variance_min": critic.value_preprocessor.running_variance_min,
-            #                 f"Value scaler {critic_idx} / running_variance_max": critic.value_preprocessor.running_variance_max,
-            #             })
-            # else:
-            #     if isinstance(self._value_preprocessors[0], RunningStandardScaler):
-            #         wandb_dict.update({
-            #             "Value scaler / running_mean_mean": self._value_preprocessors[0].running_mean_mean,
-            #             "Value scaler / running_mean_median": self._value_preprocessors[0].running_mean_median,
-            #             "Value scaler / running_mean_min": self._value_preprocessors[0].running_mean_min,
-            #             "Value scaler / running_mean_max": self._value_preprocessors[0].running_mean_max,
-            #             "Value scaler / running_variance_mean": self._value_preprocessors[0].running_variance_mean,
-            #             "Value scaler / running_variance_median": self._value_preprocessors[0].running_variance_median,
-            #             "Value scaler / running_variance_min": self._value_preprocessors[0].running_variance_min,
-            #             "Value scaler / running_variance_max": self._value_preprocessors[0].running_variance_max,
-            #         })
+            if self._num_critics > 1:
+                # Per-critic advantage stats
+                for i, name in enumerate(self._critic_names):
+                    adv_slice = sampled_advantages[:, i] if sampled_advantages.dim() > 1 and sampled_advantages.shape[-1] > 1 else sampled_advantages.squeeze(-1)
+                    wandb_dict[f"Advantages / {name}_mean"] = adv_slice.mean().item()
+                    wandb_dict[f"Advantages / {name}_std"] = adv_slice.std().item()
+
+                # Total advantage stats (weighted sum)
+                total_adv = (sampled_advantages * self._critic_weights).sum(dim=-1) if sampled_advantages.dim() > 1 and sampled_advantages.shape[-1] > 1 else sampled_advantages.squeeze(-1)
+                wandb_dict["Advantages / total_mean"] = total_adv.mean().item()
+                wandb_dict["Advantages / total_std"] = total_adv.std().item()
+
+                # Per-critic value preprocessor stats
+                for critic_idx, critic in enumerate(self.value.critics):
+                    name = self._critic_names[critic_idx]
+                    wandb_dict[f"Value scaler / {name} mu_mean"] = critic.value_preprocessor.running_mean_mean
+                    wandb_dict[f"Value scaler / {name} variance_mean"] = critic.value_preprocessor.running_variance_mean
+            else:
+                wandb_dict.update({
+                    "Value scaler / mu_mean": self.value.value_preprocessor.running_mean_mean,
+                    "Value scaler / variance_mean": self.value.value_preprocessor.running_variance_mean,
+                })
 
             # Log policy standard deviation
             wandb_dict["Policy / Standard deviation"] = self.policy.distribution().stddev.mean().item()
+            
+            # Log learning rates for each optimizer
+            wandb_dict["Learning Rate / Policy"] = self.policy_optimiser.param_groups[0]["lr"]
+            wandb_dict["Learning Rate / Value"] = self.value_optimiser.param_groups[0]["lr"]
+            wandb_dict["Learning Rate / Encoder"] = self.encoder_optimiser.param_groups[0]["lr"]
+            
             self.wandb_session.log(wandb_dict)
 
         # Update step counters
@@ -686,27 +745,6 @@ class PPO:
         self.encoder.eval()
 
         return False
-
-    def compute_multicritic_loss(self, predicted_values: torch.Tensor, sampled_values: torch.Tensor, sampled_returns: torch.Tensor) -> torch.Tensor:
-        # Compute loss for each critic separately
-        critic_losses = []
-        for critic_idx in range(self._num_critics):
-            critic_predicted = predicted_values[:, critic_idx:critic_idx+1]
-            critic_sampled_values = sampled_values[:, critic_idx:critic_idx+1]
-            critic_sampled_returns = sampled_returns[:, critic_idx:critic_idx+1]
-            
-            if self._value_clip > 0:
-                critic_predicted = critic_sampled_values + torch.clamp(
-                    critic_predicted - critic_sampled_values,
-                    min=-self._value_clip,
-                    max=self._value_clip,
-                )
-            
-            critic_losses.append(F.mse_loss(critic_sampled_returns, critic_predicted))
-        
-        # Sum losses across all critics
-        value_loss = self._value_loss_scale * sum(critic_losses)
-        return value_loss
 
     def _check_instability(self, x, name):
         """Check for NaN/Inf values in tensor (debug mode only).

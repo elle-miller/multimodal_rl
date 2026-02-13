@@ -46,6 +46,52 @@ You should now see it with `pip show multimodal_rl`.
 
 ![multimodal_rl](readme_assets/diagram.png)
 
+### Agent configuration
+An agent is defined by its `{cfg_name}.yaml` file, which specifies the `agent`, `observations`, `encoder`, `policy`, `value`, `trainer`, `experiment` setup. The `agent` defines the PPO hyperparameters, largely similar to `skrl` setup. There are important differences in our PPO implementation, read more here.
+
+We use dictionary-style observations, and categorising into proprioception, tactile, rgb, depth, and gt (ground-truth). To specify which observations are used, add the keys to `obs_list` in the agent cfg.
+
+```
+observations:
+  obs_list:
+  - prop
+  - tactile
+  - rgb
+  - depth
+  - gt
+  obs_stack: 4
+  pixel_cfg: 
+    width: 80
+    height: 80
+    latent_pixel_dim: 256
+    normalise_rgb: false
+    max_depth: 2.0
+  tactile_cfg:
+    binary_tactile: true
+    binary_threshold: 0.01
+
+encoder:
+  method: "early"
+  hiddens: [1024, 512, 256]
+  activations: ["elu", "elu", "elu"]
+  layernorm: True
+  state_preprocessor: True
+  latent_state_dim: 256
+
+policy:
+  state_dependent_log_std: True
+  clip_log_std: True
+  initial_log_std: 0
+  min_log_std: -20.0
+  max_log_std: 2.0
+  hiddens: [128, 64]
+  activations: ["elu", "elu", "tanh"]
+  
+value:
+  hiddens: [128, 64]
+  activations: ["elu", "elu", "identity"]
+```
+
 ### Evaluation Procedure
 Evaluation runs continuously in parallel with training using dedicated evaluation environments. At each episode boundary (every `max_episode_length` steps), the current policy and encoder are snapshotted into frozen copies. These frozen models are used exclusively for evaluation, ensuring that each evaluation episode uses a consistent policy version even as training continues and updates the live policy. Evaluation environments are visually distinguished in the simulation (typically marked with pink boxes) and reset synchronously at episode boundaries. Episode metrics (returns, info logs) are accumulated with proper masking for terminated/truncated episodes, and logged at episode boundaries.
 

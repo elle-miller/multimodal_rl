@@ -6,13 +6,18 @@ for combining visual (RGB, depth) and state-based (proprioception, tactile, grou
 
 import torch
 import torch.nn as nn
-
+import numpy as np
 from multimodal_rl.models.cnn import ImageEncoder
 from multimodal_rl.models.mlp import MLP
 from multimodal_rl.models.running_standard_scaler import RunningStandardScalerDict
 
 FUSION_METHODS = ["early", "intermediate"]
 
+def init_encoder_weights(module):
+    if isinstance(module, nn.Linear):
+        # Using sqrt(2) for ReLU/LeakyReLU to keep signal variance stable
+        nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+        nn.init.constant_(module.bias, 0.0)
 
 class Encoder(nn.Module):
     """Multimodal encoder supporting early and intermediate fusion strategies.
@@ -98,6 +103,9 @@ class Encoder(nn.Module):
             self.activations,
             layernorm=config_dict["encoder"]["layernorm"]
         ).to(device)
+
+        # Initialize encoder network with standard gain (sqrt(2) for ReLU/Tanh)
+        self.net.apply(init_encoder_weights)
 
     def forward(self, obs_dict, detach=False, train=False):
         """Forward pass through the encoder.
