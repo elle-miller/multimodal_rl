@@ -108,7 +108,7 @@ class PPO:
         self._device_type = torch.device(self.device).type
         self.memory = memory
         self.global_step = 0
-        self.num_train_envs = self.memory.num_envs
+        self.num_train_envs = self.memory.num_envs if self.memory is not None else 0
 
         # Writer setup
         self.writer = writer

@@ -122,7 +122,7 @@ SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "headless": False,
     "disable_progressbar": False,
     "close_environment_at_exit": False,
-    "staggered_resets": True,  # Stagger training environment resets for better sample diversity
+    "staggered_resets": False,  # Stagger training environment resets for better sample diversity
 }
 
 
@@ -165,7 +165,7 @@ class Trainer:
         self.headless = self.cfg.get("headless", False)
         self.disable_progressbar = self.cfg.get("disable_progressbar", False)
         self.close_environment_at_exit = self.cfg.get("close_environment_at_exit", True)
-        self.staggered_resets = self.cfg.get("staggered_resets", True)
+        self.staggered_resets = self.cfg.get("staggered_resets", False)
 
         # Training parameters
         # Global steps accumulate over all environments: global_step = num_train_envs * training_steps
