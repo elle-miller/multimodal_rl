@@ -268,21 +268,23 @@ class Trainer:
                 train_z = self.encoder(train_states)
                 train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
 
-
                 # Combine actions from eval and training environments
                 actions[: self.num_eval_envs] = eval_actions.detach()
                 actions[self.num_eval_envs :] = train_actions.detach()
 
-                # Step environments
+                # Step environments and render
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
-                next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
-
-                # Render if not headless
                 if not self.headless:
                     self.env.render()
 
+                # Save both train/eval envs to SSL auxiliary memory if using separate memory
+                if self.ssl_task is not None and not self.ssl_task.use_same_memory:
+                    self.save_transition_to_ssl_memory(states, actions, terminated, truncated)
+                    
+                next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
+
                 # Save transition to RL memory for training
-                self.save_transition_to_memory(
+                self.save_transition_to_rl_memory(
                     train_states, train_actions, train_log_prob, rewards[self.num_eval_envs :, :], next_train_states, terminated[self.num_eval_envs :, :], truncated[self.num_eval_envs :, :], infos
                 )
         
@@ -446,7 +448,7 @@ class Trainer:
             depth_color = depth_color.transpose(0, 3, 1, 2)  # [T, H, W, 3] -> [T, C, H, W]
             wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
 
-    def save_transition_to_memory(
+    def save_transition_to_rl_memory(
         self, states, actions, log_prob, rewards, next_states, terminated, truncated, infos
     ):
         """Save transition to memory buffers and update evaluation metrics.
@@ -464,19 +466,7 @@ class Trainer:
             truncated: Truncation flags.
             infos: Environment info dictionary.
         """
-        # Save to SSL auxiliary memory if using separate memory
-        if self.ssl_task is not None and not self.ssl_task.use_same_memory:
-            # Deep copy to avoid modifying tensors used by PPO
-            if isinstance(self.ssl_task, ForwardDynamics):
-                self.ssl_task.add_samples(
-                    states=deepcopy(states),
-                    actions=deepcopy(actions),
-                    done=deepcopy(terminated | truncated),
-                )
-            elif isinstance(self.ssl_task, Reconstruction):
-                self.ssl_task.add_samples(states=states)
-            else:
-                raise ValueError(f"Unknown SSL task type: {type(self.ssl_task)}")
+
 
         # Record to PPO memory
         self.agent.record_transition(
@@ -490,15 +480,38 @@ class Trainer:
             timestep=self.global_step,
         )
 
+    def save_transition_to_ssl_memory(self, states, actions, terminated, truncated):
+        """Save transition to SSL memory.
+        
+        Args:
+            states: Current state observations.
+            actions: Actions taken.
+            log_prob: Log probabilities of training actions.
+            rewards: Rewards received.
+        """
+        if isinstance(self.ssl_task, ForwardDynamics):
+            self.ssl_task.add_samples(
+                states=deepcopy(states),
+                actions=deepcopy(actions),
+                done=deepcopy(terminated | truncated),
+            )
+        elif isinstance(self.ssl_task, Reconstruction):
+            self.ssl_task.add_samples(states=states)
+        else:
+            raise ValueError(f"Unknown SSL task type: {type(self.ssl_task)}")
+
     def split_train_eval_obs(self, obs, n):
-        """Extract observations from last n environments.
+        """Split observations into train and eval along the env dimension.
+        
+        Preserves LazyFrames by slicing each internal frame individually
+        and wrapping the results back into new LazyFrames objects.
         
         Args:
             obs: Observation dictionary.
-            n: Number of environments to skip from the beginning.
+            n: Number of eval environments (first n envs are eval).
             
         Returns:
-            Observation dictionary containing only training environments.
+            Tuple of (train_obs, eval_obs) observation dictionaries.
         """
         eval_obs = {}
         train_obs = {}
