@@ -16,7 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple, Union
-from multimodal_rl.rl.pcgrad import PCGrad
 from multimodal_rl.rl.memories import Memory
 from multimodal_rl.rl.kl_adaptive_scheduler import KLAdaptiveLR
 
