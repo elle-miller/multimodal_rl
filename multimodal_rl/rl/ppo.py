@@ -598,21 +598,12 @@ class PPO:
                 if self.ssl_task is not None:
                     self.ssl_task.optimiser.zero_grad()
 
-                # Check for numerical instability
-                # if torch.isnan(loss).any() or torch.isinf(loss).any():
-                #     print(f"NaN/Inf detected in loss at epoch {epoch}, minibatch {i}")
-                #     self._check_instability(policy_loss, "policy_loss")
-                #     self._check_instability(value_loss, "value_loss")
-                #     self._check_instability(predicted_values, "predicted_values")
-                #     self._check_instability(sampled_actions, "sampled_actions")
-                #     self._check_instability(sampled_states["policy"].get("prop"), "prop")
-                #     self._check_instability(sampled_values, "sampled_values")
-                #     self._check_instability(sampled_returns, "sampled_returns")
-                #     self._check_instability(sampled_log_prob, "sampled_log_prob")
-                #     self._check_instability(sampled_advantages, "sampled_advantages")
-                #     if self.wandb_session is not None:
-                #         self.wandb_session.finish()
-                #     return True
+                # Check for numerical instability before backward
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                    print(f"[PPO] NaN/Inf detected in loss at epoch {epoch}, minibatch {i}. Stopping training.")
+                    if self.wandb_session is not None:
+                        self.wandb_session.finish()
+                    return True
 
                 # Backward pass
                 loss.backward()

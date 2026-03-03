@@ -113,6 +113,8 @@ class EpisodeTracker:
             "min_returns": self.returns.min().item(),
             "std_returns": self.returns.std().item(),
             "median_returns": self.returns.median().item(),
+            "steps_to_term": self.steps_to_term.mean().item(),
+            "steps_to_trunc": self.steps_to_trunc.mean().item(),
         }
     
     def get_mean_info(self):
