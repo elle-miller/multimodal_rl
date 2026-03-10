@@ -184,7 +184,7 @@ class ForwardDynamics(AuxiliaryTask):
         # Only add transitions for environments that remained alive throughout the sequence
         if not torch.any(fully_alive_mask):
             print("no fully alive")
-            return None, None, None    
+            return None, None    
         
         obs_dict_seq = {}
         for obs_k in self.env.observation_space["policy"].keys():
