@@ -10,6 +10,7 @@ EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
     # NOTE: Add dependencies
+    "packaging",
     "psutil",
     "tbparse",
     "optuna",

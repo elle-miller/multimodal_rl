@@ -57,6 +57,10 @@ class EpisodeTracker:
             info_metrics: Optional dict of info metrics to accumulate.
         """
         # Update masks
+        # Track steps until termination/truncation (increment for active episodes)
+        self.steps_to_term += self.active_mask * (1 - terminated.float())
+        self.steps_to_trunc += self.active_mask * (1 - truncated.float())
+
         done = terminated | truncated
         self.active_mask *= (1 - done.float())
         
@@ -64,9 +68,7 @@ class EpisodeTracker:
         self.unmasked_returns += rewards
         self.returns += rewards * self.active_mask
         
-        # Track steps until termination/truncation (increment for active episodes)
-        self.steps_to_term += self.active_mask * (1 - terminated.float())
-        self.steps_to_trunc += self.active_mask * (1 - truncated.float())
+        
 
         # Accumulate info metrics (scalar mean per timestep, weighted by active mask)
         if info_metrics is not None:
@@ -116,6 +118,13 @@ class EpisodeTracker:
     def get_mean_info(self):
         """Get mean info metrics across environments."""
         return {k: v.mean().item() for k, v in self.info_metrics.items()}
+
+    def get_mean_episode_lengths(self):
+        """Mean steps-to-done counters across eval envs (per completed episode window)."""
+        return {
+            "steps_to_term": self.steps_to_term.mean().item(),
+            "steps_to_truncated": self.steps_to_trunc.mean().item(),
+        }
 
 SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "timesteps": 100000,
@@ -388,6 +397,13 @@ class Trainer:
         # Log episode returns
         for k, v in returns.items():
             wandb_episode_dict[f"Eval episode returns / {k}"] = v
+            if self.writer.tb_writer is not None:
+                self.writer.tb_writer.add_scalar(k, v, global_step=self.global_step)
+
+        # Log steps-to-termination / truncation (eval episode length counters)
+        length_metrics = self.episode_tracker.get_mean_episode_lengths()
+        for k, v in length_metrics.items():
+            wandb_episode_dict[f"Eval episode length / {k}"] = v
             if self.writer.tb_writer is not None:
                 self.writer.tb_writer.add_scalar(k, v, global_step=self.global_step)
 

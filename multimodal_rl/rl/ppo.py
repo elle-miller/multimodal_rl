@@ -19,6 +19,7 @@ from typing import Dict, Optional, Tuple, Union
 
 from multimodal_rl.models.running_standard_scaler import RunningStandardScaler
 from multimodal_rl.rl.memories import Memory
+from multimodal_rl.rl.kl_adaptive_scheduler import KLAdaptiveLR
 
 PPO_DEFAULT_CONFIG = {
     "rollouts": 16,
@@ -170,10 +171,55 @@ class PPO:
             
         self.num_actions = self.action_space.shape[0]
 
-        # Learning rate scheduler (if specified)
+        # Learning rate schedulers (if specified)
+        self._learning_rate_schedulers = {}
+        scheduler_kwargs = self.cfg.get("learning_rate_scheduler_kwargs", {})
+
         if self._learning_rate_scheduler is not None:
-            # Note: scheduler would need a combined optimizer, currently not implemented
-            pass
+            scheduler_name_or_class = self._learning_rate_scheduler
+            is_kl_adaptive = (
+                scheduler_name_or_class == "KLAdaptiveLR"
+                or (
+                    isinstance(scheduler_name_or_class, type)
+                    and issubclass(scheduler_name_or_class, KLAdaptiveLR)
+                )
+            )
+            policy_optim = self.policy_optimiser
+
+            if is_kl_adaptive:
+                filtered_kwargs = {k: v for k, v in scheduler_kwargs.items() if k != "apply_to_all"}
+                self._learning_rate_schedulers["policy"] = KLAdaptiveLR(
+                    policy_optim,
+                    **filtered_kwargs,
+                )
+                if scheduler_kwargs.get("apply_to_all", False):
+                    self._learning_rate_schedulers["value"] = KLAdaptiveLR(
+                        self.value_optimiser,
+                        **filtered_kwargs,
+                    )
+                    self._learning_rate_schedulers["encoder"] = KLAdaptiveLR(
+                        self.encoder_optimiser,
+                        **filtered_kwargs,
+                    )
+            else:
+                scheduler_class = scheduler_name_or_class
+                if isinstance(scheduler_class, str):
+                    import torch.optim.lr_scheduler as lr_scheduler
+
+                    scheduler_class = getattr(lr_scheduler, scheduler_class)
+
+                self._learning_rate_schedulers["policy"] = scheduler_class(
+                    policy_optim,
+                    **scheduler_kwargs,
+                )
+                self._learning_rate_schedulers["value"] = scheduler_class(
+                    self.value_optimiser,
+                    **scheduler_kwargs,
+                )
+                self._learning_rate_schedulers["encoder"] = scheduler_class(
+                    self.encoder_optimiser,
+                    **scheduler_kwargs,
+                )
 
         self.update_step = 0
         self.epoch_step = 0
@@ -530,10 +576,20 @@ class PPO:
                 if self._entropy_loss_scale > 0:
                     cumulative_entropy_loss += entropy_loss.item()
 
-            # Update learning rate scheduler if specified
-            if self._learning_rate_scheduler is not None:
-                # Note: scheduler would need combined optimizer
-                pass
+            # Update learning rate schedulers if specified
+            if self._learning_rate_schedulers:
+                avg_kl = (
+                    torch.tensor(kl_divergences, device=self.device).mean()
+                    if kl_divergences
+                    else None
+                )
+
+                for _, scheduler in self._learning_rate_schedulers.items():
+                    if isinstance(scheduler, KLAdaptiveLR):
+                        if avg_kl is not None:
+                            scheduler.step(avg_kl.item())
+                    else:
+                        scheduler.step()
 
             self.epoch_step += 1
             cumulative_policy_loss += epoch_policy_loss
@@ -553,6 +609,21 @@ class PPO:
             if self.tb_writer is not None:
                 self.tb_writer.add_scalar("policy_loss", wandb_dict["Loss / Policy loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("value_loss", wandb_dict["Loss / Value loss"], global_step=self.global_step)
+                self.tb_writer.add_scalar(
+                    "learning_rate/policy",
+                    self.policy_optimiser.param_groups[0]["lr"],
+                    global_step=self.update_step,
+                )
+                self.tb_writer.add_scalar(
+                    "learning_rate/value",
+                    self.value_optimiser.param_groups[0]["lr"],
+                    global_step=self.update_step,
+                )
+                self.tb_writer.add_scalar(
+                    "learning_rate/encoder",
+                    self.encoder_optimiser.param_groups[0]["lr"],
+                    global_step=self.update_step,
+                )
 
             # Log SSL task metrics
             if self.ssl_task is not None:
@@ -590,6 +661,9 @@ class PPO:
 
             # Log policy standard deviation
             wandb_dict["Policy / Standard deviation"] = self.policy.distribution().stddev.mean().item()
+            wandb_dict["Learning Rate / Policy"] = self.policy_optimiser.param_groups[0]["lr"]
+            wandb_dict["Learning Rate / Value"] = self.value_optimiser.param_groups[0]["lr"]
+            wandb_dict["Learning Rate / Encoder"] = self.encoder_optimiser.param_groups[0]["lr"]
             self.wandb_session.log(wandb_dict)
 
         # Update step counters
