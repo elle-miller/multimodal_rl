@@ -139,6 +139,11 @@ class IsaacLabWrapper(object):
         return self._unwrapped.num_envs if hasattr(self._unwrapped, "num_envs") else 1
 
     @property
+    def num_train_envs(self) -> int:
+        """Parallel training envs (total minus eval slice used by :class:`Trainer`)."""
+        return self.num_envs - self.num_eval_envs
+
+    @property
     def observation_space(self) -> gymnasium.Space:
         """Observation space"""
         return self._unwrapped.single_observation_space

@@ -56,16 +56,17 @@ class EpisodeTracker:
             truncated: Truncation flags.
             info_metrics: Optional dict of info metrics to accumulate.
         """
-        # Update masks
-        done = terminated | truncated
-        self.active_mask *= (1 - done.float())
-        
-        # Accumulate returns (masked and unmasked)
         rewards = rewards if rewards.dim() == 1 else rewards.sum(dim=-1, keepdim=True)
 
+        # Apply rewards *before* zeroing active_mask for done envs. Otherwise the terminal
+        # transition's reward is dropped (mask is already 0), so single-step episodes always
+        # log return 0 even with dense shaping.
         self.unmasked_returns += rewards
         self.returns += rewards * self.active_mask
-        
+
+        done = terminated | truncated
+        self.active_mask *= (1 - done.float())
+
         # Track steps until termination/truncation (increment for active episodes)
         self.steps_to_term += self.active_mask * (1 - terminated.float())
         self.steps_to_trunc += self.active_mask * (1 - truncated.float())
@@ -260,6 +261,11 @@ class Trainer:
 
             # update global step
             self.global_step = timestep * self.num_train_envs
+            # Object-manipulation tasks: drive demo-reset decay schedule (imitation_demo_reset_* on env cfg).
+            if hasattr(self.env, "env") and hasattr(self.env.env, "unwrapped"):
+                fn = getattr(self.env.env.unwrapped, "set_imitation_global_training_timestep", None)
+                if callable(fn):
+                    fn(self.global_step)
 
             # Compute actions
             with torch.no_grad():
@@ -294,6 +300,9 @@ class Trainer:
                 if "log" in infos:
                     eval_info = {}
                     for k, v in infos["log"].items():
+                        # AIREC (and others) pre-register log keys with None until first task step fills them.
+                        if v is None:
+                            continue
                         eval_info[k] = v[: self.num_eval_envs]
                 self.episode_tracker.update(
                     rewards=rewards[: self.num_eval_envs, :],
@@ -380,7 +389,18 @@ class Trainer:
         if "counters" in infos:
             for k, v in infos["counters"].items():
                 if v is not None:
-                    metric_value = v[: self.num_eval_envs].mean().cpu()
+                    ve = v[: self.num_eval_envs]
+                    # Per-episode minimum distance: mean() over parallel eval envs dilutes the metric
+                    # (e.g. a few successes at ~0.03 m mixed with many failures at ~1 m → ~1 m mean).
+                    if k == "episode_best_object2goal_min_m":
+                        finite = ve[torch.isfinite(ve)]
+                        metric_value = (
+                            finite.min().cpu()
+                            if finite.numel()
+                            else torch.tensor(float("nan"))
+                        )
+                    else:
+                        metric_value = ve.mean().cpu()
                     wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
                     if self.writer.tb_writer is not None:
                         self.writer.tb_writer.add_scalar(k, metric_value, global_step=self.global_step)
@@ -388,7 +408,13 @@ class Trainer:
         # Get episode metrics from tracker
         returns = self.episode_tracker.get_mean_returns()
         info_metrics = self.episode_tracker.get_mean_info()
-        
+        mean_eval_return = returns["mean_returns"]
+        # tqdm owns stdout for the progress bar; plain print() is often invisible. Also log before
+        # wandb/tensorboard so a logging failure does not suppress this line.
+        tqdm.tqdm.write(
+            f"{self.global_step/1e6:.2f}M steps (update {self.rl_update}): {mean_eval_return:.4f}"
+        )
+
         # Log episode returns
         for k, v in returns.items():
             wandb_episode_dict[f"Eval episode returns / {k}"] = v
@@ -404,9 +430,6 @@ class Trainer:
         # Log to wandb
         if self.writer.wandb_session is not None:
             self.writer.wandb_session.log(wandb_episode_dict)
-
-        mean_eval_return = returns["mean_returns"]
-        print(f"{self.global_step/1e6:.2f}M steps (update {self.rl_update}): {mean_eval_return:.4f}")
 
         # Save checkpoint
         if not play:
