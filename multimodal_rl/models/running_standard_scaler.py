@@ -148,6 +148,10 @@ class RunningStandardScaler(nn.Module):
         if isinstance(x, LazyFrames):
             x = x[:]
 
+        # Binary tactile (and similar) may be stored as bool; scaler math requires float.
+        if x.dtype == torch.bool:
+            x = x.float()
+
         if train:
 
             if x.dim() == 3:
