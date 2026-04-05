@@ -19,6 +19,72 @@ from multimodal_rl.ssl.dynamics import ForwardDynamics
 from multimodal_rl.ssl.reconstruction import Reconstruction
 
 
+def _all_finite_tensor(t: torch.Tensor) -> bool:
+    return bool(torch.isfinite(t).all().item())
+
+
+def _all_finite_nested(obj: Any) -> bool:
+    if isinstance(obj, torch.Tensor):
+        return _all_finite_tensor(obj)
+    if isinstance(obj, dict):
+        return all(_all_finite_nested(v) for v in obj.values())
+    return True
+
+
+def _nan_to_num_nested(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return torch.nan_to_num(obj)
+    if isinstance(obj, dict):
+        return {k: _nan_to_num_nested(v) for k, v in obj.items()}
+    return obj
+
+
+def _train_transition_finite(
+    train_states: Any,
+    train_actions: torch.Tensor,
+    train_log_prob: torch.Tensor,
+    rewards: torch.Tensor,
+    next_train_states: Any,
+    num_eval_envs: int,
+) -> bool:
+    """True if all training-env transition tensors are finite (no NaN/Inf)."""
+    r_train = rewards[num_eval_envs:, :]
+    return (
+        _all_finite_nested(train_states)
+        and _all_finite_tensor(train_actions)
+        and _all_finite_tensor(train_log_prob)
+        and _all_finite_tensor(r_train)
+        and _all_finite_nested(next_train_states)
+    )
+
+
+def _sanitize_train_rewards(rewards: torch.Tensor, num_eval_envs: int) -> torch.Tensor:
+    """Training-env reward slice with NaN/Inf replaced by 0 (never store non-finite rewards)."""
+    r = rewards[num_eval_envs:, :]
+    if r.dim() == 1:
+        r = r.unsqueeze(-1)
+    return torch.nan_to_num(r.clone())
+
+
+def _mask_nan_train_transition_for_memory(
+    train_states: Any,
+    train_actions: torch.Tensor,
+    train_log_prob: torch.Tensor,
+    rewards: torch.Tensor,
+    next_train_states: Any,
+    num_eval_envs: int,
+) -> tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+    """Return copies with NaN/Inf replaced by zero so PPO memory stays finite."""
+    r_train = _sanitize_train_rewards(rewards, num_eval_envs)
+    return (
+        _nan_to_num_nested(train_states),
+        torch.nan_to_num(train_actions.clone()),
+        torch.nan_to_num(train_log_prob.clone()),
+        r_train,
+        _nan_to_num_nested(next_train_states),
+    )
+
+
 @dataclass
 class EpisodeTracker:
     """Tracks episode-level metrics for evaluation environments.
@@ -271,11 +337,13 @@ class Trainer:
             with torch.no_grad():
 
                 # Evaluation: use frozen snapshot for consistent policy
-                eval_z = self.eval_encoder(eval_states)
+                eval_obs = _nan_to_num_nested(eval_states)
+                eval_z = self.eval_encoder(eval_obs)
                 eval_actions, _, _ = self.eval_policy.act(eval_z, deterministic=True)
                 
-                # Training: use live policy
-                train_z = self.encoder(train_states)
+                # Training: sanitize observations before encoder + policy (NaNs come from sim / sensors)
+                train_obs = _nan_to_num_nested(train_states)
+                train_z = self.encoder(train_obs)
                 train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
 
                 # Combine actions from eval and training environments
@@ -285,14 +353,46 @@ class Trainer:
                 # Step environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
                 next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
+                next_train_obs = _nan_to_num_nested(next_train_states)
 
                 # Render if not headless
                 if not self.headless:
                     self.env.render()
 
-                # Save transition to RL memory for training
+                # Save transition to RL memory (same sanitized obs as encoder/policy; never store NaN rewards)
+                mem_rewards = _sanitize_train_rewards(rewards, self.num_eval_envs)
+                if _train_transition_finite(
+                    train_obs,
+                    train_actions,
+                    train_log_prob,
+                    rewards,
+                    next_train_obs,
+                    self.num_eval_envs,
+                ):
+                    mem_states = train_obs
+                    mem_actions = train_actions
+                    mem_log_prob = train_log_prob
+                    mem_next_states = next_train_obs
+                else:
+                    mem_states, mem_actions, mem_log_prob, _, mem_next_states = (
+                        _mask_nan_train_transition_for_memory(
+                            train_obs,
+                            train_actions,
+                            train_log_prob,
+                            rewards,
+                            next_train_obs,
+                            self.num_eval_envs,
+                        )
+                    )
                 self.save_transition_to_memory(
-                    train_states, train_actions, train_log_prob, rewards[self.num_eval_envs :, :], next_train_states, terminated[self.num_eval_envs :, :], truncated[self.num_eval_envs :, :], infos
+                    mem_states,
+                    mem_actions,
+                    mem_log_prob,
+                    mem_rewards,
+                    mem_next_states,
+                    terminated[self.num_eval_envs :, :],
+                    truncated[self.num_eval_envs :, :],
+                    infos,
                 )
         
                 # Update episode tracker
@@ -304,8 +404,11 @@ class Trainer:
                         if v is None:
                             continue
                         eval_info[k] = v[: self.num_eval_envs]
+                eval_r = rewards[: self.num_eval_envs, :]
+                if eval_r.dim() == 1:
+                    eval_r = eval_r.unsqueeze(-1)
                 self.episode_tracker.update(
-                    rewards=rewards[: self.num_eval_envs, :],
+                    rewards=torch.nan_to_num(eval_r.clone()),
                     terminated=terminated[: self.num_eval_envs, :],
                     truncated=truncated[: self.num_eval_envs, :],
                     info_metrics=eval_info
