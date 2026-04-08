@@ -365,11 +365,6 @@ class Trainer:
 
             # update global step
             self.global_step = timestep * self.num_train_envs
-            # Object-manipulation tasks: drive demo-reset decay schedule (imitation_demo_reset_* on env cfg).
-            if hasattr(self.env, "env") and hasattr(self.env.env, "unwrapped"):
-                fn = getattr(self.env.env.unwrapped, "set_imitation_global_training_timestep", None)
-                if callable(fn):
-                    fn(self.global_step)
 
             # Compute actions
             with torch.no_grad():
@@ -380,15 +375,7 @@ class Trainer:
                 
                 # Training: live policy
                 train_z = self.encoder(train_states)
-                try:
-                    train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
-                except Exception as e:
-                    print(f"Error in policy.act: {e}")
-                    print(train_z.shape)
-                    print(train_actions.shape)
-                    print(train_log_prob.shape)
-                    import time 
-                    time.sleep(1000)
+                train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
 
                 # Combine actions from eval and training environments
                 actions[: self.num_eval_envs] = eval_actions.detach()
@@ -402,22 +389,6 @@ class Trainer:
                 if not self.headless:
                     self.env.render()
 
-                if not _train_transition_finite(
-                    train_states,
-                    train_actions,
-                    train_log_prob,
-                    rewards,
-                    next_train_states,
-                    self.num_eval_envs,
-                ):
-                    _report_nonfinite_train_transition(
-                        train_states,
-                        train_actions,
-                        train_log_prob,
-                        rewards,
-                        next_train_states,
-                        self.num_eval_envs,
-                    )
                 self.save_transition_to_memory(
                     train_states,
                     train_actions,
