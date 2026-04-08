@@ -31,12 +31,75 @@ def _all_finite_nested(obj: Any) -> bool:
     return True
 
 
-def _nan_to_num_nested(obj: Any) -> Any:
+def _report_nonfinite_tensor(path: str, t: torch.Tensor, global_env_offset: int) -> None:
+    """Print observation/action key path, env index, and flattened element indices for non-finite entries."""
+    if torch.isfinite(t).all():
+        return
+    bad = ~torch.isfinite(t)
+    if t.dim() == 0:
+        print(f"[non-finite] {path} scalar tensor", flush=True)
+        return
+    n0 = t.shape[0]
+    row_has_bad = bad.reshape(n0, -1).any(dim=-1)
+    env_locals = torch.where(row_has_bad)[0]
+    for local_e in env_locals[:16]:
+        le = int(local_e.item())
+        ge = le + global_env_offset
+        row_bad = bad[local_e].reshape(-1)
+        idx = torch.nonzero(row_bad, as_tuple=False).flatten()
+        flat = t[local_e].reshape(-1)
+        take = min(24, idx.numel())
+        if take == 0:
+            continue
+        ii = idx[:take].tolist()
+        vv = flat[idx[:take]].tolist()
+        print(
+            f"[non-finite] {path} train_env_index={le} global_env_index={ge} "
+            f"flat_element_indices={ii} values={vv}",
+            flush=True,
+        )
+
+
+def _report_nonfinite_nested(obj: Any, path: str, global_env_offset: int) -> None:
     if isinstance(obj, torch.Tensor):
-        return torch.nan_to_num(obj)
-    if isinstance(obj, dict):
-        return {k: _nan_to_num_nested(v) for k, v in obj.items()}
-    return obj
+        _report_nonfinite_tensor(path, obj, global_env_offset)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            sub = f"{path}.{k}" if path else k
+            _report_nonfinite_nested(v, sub, global_env_offset)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _report_nonfinite_nested(v, f"{path}[{i}]", global_env_offset)
+
+
+def _report_nonfinite_train_transition(
+    train_states: Any,
+    train_actions: torch.Tensor,
+    train_log_prob: torch.Tensor,
+    rewards: torch.Tensor,
+    next_train_states: Any,
+    num_eval_envs: int,
+) -> None:
+    """Log which keys (e.g. policy.gt) and env/element indices are non-finite for the training batch."""
+    r_train = rewards[num_eval_envs:, :]
+    if r_train.dim() == 1:
+        r_train = r_train.unsqueeze(-1)
+    offset = num_eval_envs
+    if not _all_finite_nested(train_states):
+        print("[non-finite] --- current observation (train_states) ---", flush=True)
+        _report_nonfinite_nested(train_states, "", offset)
+    if not _all_finite_tensor(train_actions):
+        print("[non-finite] --- train_actions ---", flush=True)
+        _report_nonfinite_tensor("train_actions", train_actions, offset)
+    if not _all_finite_tensor(train_log_prob):
+        print("[non-finite] --- train_log_prob ---", flush=True)
+        _report_nonfinite_tensor("train_log_prob", train_log_prob, offset)
+    if not _all_finite_tensor(r_train):
+        print("[non-finite] --- rewards (training envs only) ---", flush=True)
+        _report_nonfinite_tensor("rewards[num_eval:]", r_train, offset)
+    if not _all_finite_nested(next_train_states):
+        print("[non-finite] --- next observation (next_train_states) ---", flush=True)
+        _report_nonfinite_nested(next_train_states, "", offset)
 
 
 def _train_transition_finite(
@@ -49,39 +112,14 @@ def _train_transition_finite(
 ) -> bool:
     """True if all training-env transition tensors are finite (no NaN/Inf)."""
     r_train = rewards[num_eval_envs:, :]
+    if r_train.dim() == 1:
+        r_train = r_train.unsqueeze(-1)
     return (
         _all_finite_nested(train_states)
         and _all_finite_tensor(train_actions)
         and _all_finite_tensor(train_log_prob)
         and _all_finite_tensor(r_train)
         and _all_finite_nested(next_train_states)
-    )
-
-
-def _sanitize_train_rewards(rewards: torch.Tensor, num_eval_envs: int) -> torch.Tensor:
-    """Training-env reward slice with NaN/Inf replaced by 0 (never store non-finite rewards)."""
-    r = rewards[num_eval_envs:, :]
-    if r.dim() == 1:
-        r = r.unsqueeze(-1)
-    return torch.nan_to_num(r.clone())
-
-
-def _mask_nan_train_transition_for_memory(
-    train_states: Any,
-    train_actions: torch.Tensor,
-    train_log_prob: torch.Tensor,
-    rewards: torch.Tensor,
-    next_train_states: Any,
-    num_eval_envs: int,
-) -> tuple[Any, torch.Tensor, torch.Tensor, torch.Tensor, Any]:
-    """Return copies with NaN/Inf replaced by zero so PPO memory stays finite."""
-    r_train = _sanitize_train_rewards(rewards, num_eval_envs)
-    return (
-        _nan_to_num_nested(train_states),
-        torch.nan_to_num(train_actions.clone()),
-        torch.nan_to_num(train_log_prob.clone()),
-        r_train,
-        _nan_to_num_nested(next_train_states),
     )
 
 
@@ -337,14 +375,20 @@ class Trainer:
             with torch.no_grad():
 
                 # Evaluation: use frozen snapshot for consistent policy
-                eval_obs = _nan_to_num_nested(eval_states)
-                eval_z = self.eval_encoder(eval_obs)
+                eval_z = self.eval_encoder(eval_states)
                 eval_actions, _, _ = self.eval_policy.act(eval_z, deterministic=True)
                 
-                # Training: sanitize observations before encoder + policy (NaNs come from sim / sensors)
-                train_obs = _nan_to_num_nested(train_states)
-                train_z = self.encoder(train_obs)
-                train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
+                # Training: live policy
+                train_z = self.encoder(train_states)
+                try:
+                    train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
+                except Exception as e:
+                    print(f"Error in policy.act: {e}")
+                    print(train_z.shape)
+                    print(train_actions.shape)
+                    print(train_log_prob.shape)
+                    import time 
+                    time.sleep(1000)
 
                 # Combine actions from eval and training environments
                 actions[: self.num_eval_envs] = eval_actions.detach()
@@ -353,43 +397,33 @@ class Trainer:
                 # Step environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
                 next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
-                next_train_obs = _nan_to_num_nested(next_train_states)
 
                 # Render if not headless
                 if not self.headless:
                     self.env.render()
 
-                # Save transition to RL memory (same sanitized obs as encoder/policy; never store NaN rewards)
-                mem_rewards = _sanitize_train_rewards(rewards, self.num_eval_envs)
-                if _train_transition_finite(
-                    train_obs,
+                if not _train_transition_finite(
+                    train_states,
                     train_actions,
                     train_log_prob,
                     rewards,
-                    next_train_obs,
+                    next_train_states,
                     self.num_eval_envs,
                 ):
-                    mem_states = train_obs
-                    mem_actions = train_actions
-                    mem_log_prob = train_log_prob
-                    mem_next_states = next_train_obs
-                else:
-                    mem_states, mem_actions, mem_log_prob, _, mem_next_states = (
-                        _mask_nan_train_transition_for_memory(
-                            train_obs,
-                            train_actions,
-                            train_log_prob,
-                            rewards,
-                            next_train_obs,
-                            self.num_eval_envs,
-                        )
+                    _report_nonfinite_train_transition(
+                        train_states,
+                        train_actions,
+                        train_log_prob,
+                        rewards,
+                        next_train_states,
+                        self.num_eval_envs,
                     )
                 self.save_transition_to_memory(
-                    mem_states,
-                    mem_actions,
-                    mem_log_prob,
-                    mem_rewards,
-                    mem_next_states,
+                    train_states,
+                    train_actions,
+                    train_log_prob,
+                    rewards[self.num_eval_envs :, :],
+                    next_train_states,
                     terminated[self.num_eval_envs :, :],
                     truncated[self.num_eval_envs :, :],
                     infos,
@@ -404,11 +438,8 @@ class Trainer:
                         if v is None:
                             continue
                         eval_info[k] = v[: self.num_eval_envs]
-                eval_r = rewards[: self.num_eval_envs, :]
-                if eval_r.dim() == 1:
-                    eval_r = eval_r.unsqueeze(-1)
                 self.episode_tracker.update(
-                    rewards=torch.nan_to_num(eval_r.clone()),
+                    rewards=rewards[: self.num_eval_envs, :],
                     terminated=terminated[: self.num_eval_envs, :],
                     truncated=truncated[: self.num_eval_envs, :],
                     info_metrics=eval_info

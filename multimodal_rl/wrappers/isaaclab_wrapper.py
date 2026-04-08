@@ -74,7 +74,8 @@ class IsaacLabWrapper(object):
         :return: Observation, reward, terminated, truncated, info
         :rtype: tuple of torch.Tensor and any other info
         """
-        self._observations, reward, terminated, truncated, self._info = self._env.step(actions)
+        clean_actions = torch.nan_to_num(actions, nan=0.0)
+        self._observations, reward, terminated, truncated, self._info = self._env.step(clean_actions)
 
         # ensure reward is 2D
         if reward.dim() == 1:
@@ -82,10 +83,39 @@ class IsaacLabWrapper(object):
 
         if self.debug:
             for k, v in self._observations["policy"].items():
-                # actviate the LazyFrame
                 self._check_instability(v[:], f"observations_{k}")
             self._check_instability(actions, "actions")
             self._check_instability(reward, "reward")
+
+        # --- DICTIONARY-AWARE EXPLOSION SAFEGUARD ---
+        # 1. Check for NaNs across all keys in the policy dictionary
+        # We start with a zero mask on the correct device
+        nan_envs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        policy_obs = self._observations["policy"]
+        for key, value in policy_obs.items():
+            nan_envs |= torch.any(torch.isnan(value), dim=-1)
+        nan_envs |= torch.isnan(reward).flatten()
+
+        if nan_envs.any():
+            nan_indices = nan_envs.nonzero(as_tuple=False).flatten()
+            print(f"[Safeguard] NaNs in policy dict at envs: {nan_indices.tolist()}. Resetting.")
+
+            # 2. Trigger the reset for corrupted indices
+            # This resets the physics state in PhysX
+            self._unwrapped._reset_idx(nan_indices)
+            
+            # 3. Clean the data for the RL buffer
+            reward[nan_envs] = 0.0
+            terminated[nan_envs] = True
+            
+            # 4. Critical: Update observations after the reset
+            # This replaces the NaNs in self._observations with the initial state
+            new_obs = self._unwrapped.get_observations()
+            self._observations = new_obs
+            # Final sanity check: if any NaNs remain in reward, zero them
+            reward = torch.nan_to_num(reward, nan=0.0)
+        # --- END SAFEGUARD ---
 
         return self._observations, reward, terminated.view(-1, 1), truncated.view(-1, 1), self._info
 
