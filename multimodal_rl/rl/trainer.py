@@ -126,14 +126,16 @@ def _train_transition_finite(
 @dataclass
 class EpisodeTracker:
     """Tracks episode-level metrics for evaluation environments.
-    
-    Accumulates rewards and info metrics, handling episode boundaries
-    with masking to avoid counting terminated/truncated episodes.
+
+    Accumulates scalar return, ``infos['log']`` diagnostics, and per-component
+    ``infos['rewards']`` tensors (e.g. env ``extras['rewards']``), using the same
+    active-episode mask as returns.
     """
     num_eval_envs: int
     device: torch.device
     info_keys: list = field(default_factory=list)
-    
+    reward_keys: list = field(default_factory=list)
+
     def __post_init__(self):
         """Initialize tracking tensors."""
         # Returns tracking
@@ -141,24 +143,36 @@ class EpisodeTracker:
         self.unmasked_returns = torch.zeros((self.num_eval_envs, 1), device=self.device)
         self.steps_to_term = torch.zeros((self.num_eval_envs, 1), device=self.device)
         self.steps_to_trunc = torch.zeros((self.num_eval_envs, 1), device=self.device)
-        
-        # Info metrics tracking
+
+        # Per-step scalars from infos["log"] and infos["rewards"] (e.g. env extras)
         self.info_metrics = {
             k: torch.zeros((self.num_eval_envs, 1), device=self.device)
             for k in self.info_keys
+        }
+        self.reward_metrics = {
+            k: torch.zeros((self.num_eval_envs, 1), device=self.device)
+            for k in self.reward_keys
         }
         
         # Active episode mask (1 = active, 0 = done)
         self.active_mask = torch.ones((self.num_eval_envs, 1), device=self.device)
     
-    def update(self, rewards, terminated, truncated, info_metrics=None):
+    def update(
+        self,
+        rewards,
+        terminated,
+        truncated,
+        info_metrics=None,
+        reward_metrics=None,
+    ):
         """Update tracking with new timestep data.
         
         Args:
             rewards: Rewards tensor for eval envs.
             terminated: Termination flags.
             truncated: Truncation flags.
-            info_metrics: Optional dict of info metrics to accumulate.
+            info_metrics: Optional dict of infos['log'] tensors (eval env slice) to accumulate.
+            reward_metrics: Optional dict of infos['rewards'] tensors (eval slice) to accumulate.
         """
         rewards = rewards if rewards.dim() == 1 else rewards.sum(dim=-1, keepdim=True)
 
@@ -175,30 +189,38 @@ class EpisodeTracker:
         self.steps_to_term += self.active_mask * (1 - terminated.float())
         self.steps_to_trunc += self.active_mask * (1 - truncated.float())
 
-        # Accumulate info metrics (scalar mean per timestep, weighted by active mask)
+        mask_weight = self.active_mask.mean().item()
+
         if info_metrics is not None:
             for k, v in info_metrics.items():
-                if k in self.info_metrics:
-                    # v is already sliced to eval envs, compute mean across all dimensions
-                    # Then weight by active mask mean (fraction of active episodes)
-                    # This gives a scalar that can be added to self.info_metrics[k] which is [num_eval_envs, 1]
-                    scalar_value = v.mean().item() if v.numel() > 0 else 0.0
-                    mask_weight = self.active_mask.mean().item()
-                    # Add scalar to all elements of the tensor (broadcasting)
-                    self.info_metrics[k] += scalar_value * mask_weight
-    
-    def reset(self, info_keys=None):
+                if k not in self.info_metrics:
+                    continue
+                scalar_value = v.mean().item() if v.numel() > 0 else 0.0
+                self.info_metrics[k] += scalar_value * mask_weight
+
+        if reward_metrics is not None:
+            for k, v in reward_metrics.items():
+                if k not in self.reward_metrics:
+                    # Reset may not list rewards until the first env step fills extras["rewards"].
+                    self.reward_metrics[k] = torch.zeros(
+                        (self.num_eval_envs, 1), device=self.device
+                    )
+                scalar_value = v.mean().item() if v.numel() > 0 else 0.0
+                self.reward_metrics[k] += scalar_value * mask_weight
+
+    def reset(self, info_keys=None, reward_keys=None):
         """Reset all tracking to initial state.
         
         Args:
-            info_keys: Optional new list of info keys (if changed).
+            info_keys: Optional new list of infos['log'] keys (if changed).
+            reward_keys: Optional new list of infos['rewards'] keys (if changed).
         """
         self.returns.zero_()
         self.unmasked_returns.zero_()
         self.steps_to_term.zero_()
         self.steps_to_trunc.zero_()
         self.active_mask.fill_(1.0)
-        
+
         if info_keys is not None:
             self.info_keys = info_keys
             self.info_metrics = {
@@ -207,6 +229,16 @@ class EpisodeTracker:
             }
         else:
             for v in self.info_metrics.values():
+                v.zero_()
+
+        if reward_keys is not None:
+            self.reward_keys = reward_keys
+            self.reward_metrics = {
+                k: torch.zeros((self.num_eval_envs, 1), device=self.device)
+                for k in reward_keys
+            }
+        else:
+            for v in self.reward_metrics.values():
                 v.zero_()
     
     def get_mean_returns(self):
@@ -225,6 +257,10 @@ class EpisodeTracker:
     def get_mean_info(self):
         """Get mean info metrics across environments."""
         return {k: v.mean().item() for k, v in self.info_metrics.items()}
+
+    def get_mean_reward_components(self):
+        """Mean accumulated per-step values from ``infos['rewards']`` (eval envs)."""
+        return {k: v.mean().item() for k, v in self.reward_metrics.items()}
 
 SEQUENTIAL_TRAINER_DEFAULT_CONFIG = {
     "timesteps": 100000,
@@ -297,6 +333,25 @@ class Trainer:
         # We'll determine the action dimension from the first action computation
         self.actions = None
 
+    def _align_rewards_for_critics(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Ensure rewards are shaped ``(num_envs, num_critics)`` for slicing and PPO memory."""
+        n_critics = self.agent._num_critics
+        if rewards.dim() == 0:
+            raise ValueError(f"Expected per-environment rewards, got scalar shape {rewards.shape}")
+        if rewards.dim() == 1:
+            return rewards.unsqueeze(-1)
+        if rewards.dim() != 2:
+            raise ValueError(
+                f"Expected rewards (num_envs,) or (num_envs, K), got shape {rewards.shape}"
+            )
+        if rewards.shape[1] == n_critics:
+            return rewards
+        if n_critics == 1:
+            return rewards.sum(dim=-1, keepdim=True)
+        raise ValueError(
+            f"Env reward width {rewards.shape[1]} does not match num_critics={n_critics}"
+        )
+
     def train(self, play=False, trial=None):
         """Execute main training loop.
         
@@ -338,10 +393,12 @@ class Trainer:
 
         # Initialize episode tracker
         info_keys = list(infos.get("log", {}).keys())
+        reward_keys = list(infos.get("rewards", {}).keys())
         self.episode_tracker = EpisodeTracker(
             num_eval_envs=self.num_eval_envs,
             device=self.device,
-            info_keys=info_keys
+            info_keys=info_keys,
+            reward_keys=reward_keys,
         )
         ep_length = self.env.env.unwrapped.max_episode_length - 1
 
@@ -383,6 +440,7 @@ class Trainer:
 
                 # Step environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
+                rewards = self._align_rewards_for_critics(rewards)
                 next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
 
                 # Render if not headless
@@ -409,11 +467,19 @@ class Trainer:
                         if v is None:
                             continue
                         eval_info[k] = v[: self.num_eval_envs]
+                eval_reward_info = None
+                if "rewards" in infos:
+                    eval_reward_info = {}
+                    for k, v in infos["rewards"].items():
+                        if v is None:
+                            continue
+                        eval_reward_info[k] = v[: self.num_eval_envs]
                 self.episode_tracker.update(
                     rewards=rewards[: self.num_eval_envs, :],
                     terminated=terminated[: self.num_eval_envs, :],
                     truncated=truncated[: self.num_eval_envs, :],
-                    info_metrics=eval_info
+                    info_metrics=eval_info,
+                    reward_metrics=eval_reward_info,
                 )
 
             # Update agent after collecting enough rollouts
@@ -454,8 +520,9 @@ class Trainer:
                 # Reset eval envs to start fresh episode with frozen policy
                 states, infos = self.env.reset_eval_envs()
                 train_states, eval_states = self.split_train_eval_obs(states, self.num_eval_envs)
-                info_keys = list[Any](infos.get("log", {}).keys())
-                self.episode_tracker.reset(info_keys=info_keys)
+                info_keys = list(infos.get("log", {}).keys())
+                reward_keys = list(infos.get("rewards", {}).keys())
+                self.episode_tracker.reset(info_keys=info_keys, reward_keys=reward_keys)
             else:
                 # Update states for next iteration (skip if we just reset above)
                 states = next_states
@@ -504,15 +571,38 @@ class Trainer:
                             if finite.numel()
                             else torch.tensor(float("nan"))
                         )
+                        wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
+                        if self.writer.tb_writer is not None:
+                            self.writer.tb_writer.add_scalar(
+                                k, metric_value, global_step=self.global_step
+                            )
+                    elif k == "stage0_hold_count":
+                        ve_f = ve.float()
+                        mean_v = ve_f.mean().cpu()
+                        max_v = ve_f.max().cpu()
+                        wandb_episode_dict[
+                            f"Eval episode counters / {k}_mean"
+                        ] = mean_v
+                        wandb_episode_dict[f"Eval episode counters / {k}_max"] = max_v
+                        if self.writer.tb_writer is not None:
+                            self.writer.tb_writer.add_scalar(
+                                f"{k}_mean", mean_v, global_step=self.global_step
+                            )
+                            self.writer.tb_writer.add_scalar(
+                                f"{k}_max", max_v, global_step=self.global_step
+                            )
                     else:
                         metric_value = ve.mean().cpu()
-                    wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
-                    if self.writer.tb_writer is not None:
-                        self.writer.tb_writer.add_scalar(k, metric_value, global_step=self.global_step)
+                        wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
+                        if self.writer.tb_writer is not None:
+                            self.writer.tb_writer.add_scalar(
+                                k, metric_value, global_step=self.global_step
+                            )
 
         # Get episode metrics from tracker
         returns = self.episode_tracker.get_mean_returns()
         info_metrics = self.episode_tracker.get_mean_info()
+        reward_components = self.episode_tracker.get_mean_reward_components()
         mean_eval_return = returns["mean_returns"]
         # tqdm owns stdout for the progress bar; plain print() is often invisible. Also log before
         # wandb/tensorboard so a logging failure does not suppress this line.
@@ -526,7 +616,12 @@ class Trainer:
             if self.writer.tb_writer is not None:
                 self.writer.tb_writer.add_scalar(k, v, global_step=self.global_step)
 
-        # Log info metrics
+        # Log reward components from infos["rewards"] (episode-accumulated in tracker)
+        for k, v in reward_components.items():
+            wandb_episode_dict[f"Eval episode rewards / {k}"] = v
+            if self.writer.tb_writer is not None:
+                self.writer.tb_writer.add_scalar(k, v, global_step=self.global_step)
+
         for k, v in info_metrics.items():
             wandb_episode_dict[f"Eval episode info / {k}"] = v
             if self.writer.tb_writer is not None:

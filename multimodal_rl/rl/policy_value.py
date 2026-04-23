@@ -218,8 +218,6 @@ class GaussianPolicy(torch.nn.Module):
             return torch.tensor(0.0, device=self.device)
         return self._distribution.entropy().to(self.device)
 
-
-
     def distribution(self, role: str = "") -> torch.distributions.Normal:
         """Get the current action distribution.
         
@@ -280,8 +278,6 @@ class DeterministicValue(torch.nn.Module):
         if isinstance(final_layer, nn.Linear):
             nn.init.orthogonal_(final_layer.weight, gain=1.0)
             nn.init.constant_(final_layer.bias, 0.0)
-
-
 
     def compute_value(self, z, inverse=False) -> torch.Tensor:
         """Compute value estimate from latent representation.

@@ -283,12 +283,14 @@ class PPO:
             self._tensors_names = self.observation_names + [
                 "actions",
                 "log_prob",
+                "rewards",
                 "values",
                 "returns",
                 "advantages",
             ]
 
         self._current_next_states = None
+        self._active_mask = None
 
 
     def record_transition(
@@ -411,7 +413,6 @@ class PPO:
             True if NaN/Inf detected (should prune trial), False otherwise.
         """
 
-
         # Compute value estimates for terminal states: size (num_envs, num_critics)
         with torch.no_grad():
             self.value.eval()
@@ -431,9 +432,11 @@ class PPO:
             all_returns = []
             all_advantages = []
             for i in range(self._num_critics):
+                # [num_envs, rollout, num_critics]
                 rewards_i = rewards[:, :, i].unsqueeze(-1)
                 values_i = values[:, :, i].unsqueeze(-1)
                 last_values_i = last_values[:, i].unsqueeze(-1)
+                # advantages are normalised per mini-batch
                 critic_returns, critic_advantages = self.compute_gae(
                     rewards=rewards_i,
                     dones=dones,
@@ -447,6 +450,13 @@ class PPO:
             
             returns = torch.cat(all_returns, dim=-1) # size: (rollout, num_envs, num_critics)
             advantages = torch.cat(all_advantages, dim=-1) # size: (rollout, num_envs, num_critics)
+
+            # --- Compute the Active Mask ---
+            # We look across the (rollout, num_envs) dimensions for each critic.
+            # If the sum of absolute returns is 0, that critic is "off" for this rollout.
+            # size: (num_critics,)
+            with torch.no_grad():
+                self._active_mask = (returns.abs().sum(dim=(0, 1)) > 1e-5).float()
 
         else:
             returns, advantages = self.compute_gae(
@@ -503,13 +513,14 @@ class PPO:
 
             # Mini-batches loop
             for i, minibatch in enumerate(sampled_batches):
-                if len(minibatch) != 6:
-                    raise ValueError(f"Expected 6 elements in minibatch, got {len(minibatch)}")
+                if len(minibatch) != 7:
+                    raise ValueError(f"Expected 7 elements in minibatch, got {len(minibatch)}")
                 
                 (
                     sampled_states,
                     sampled_actions,
                     sampled_log_prob,
+                    sampled_rewards,
                     sampled_values,
                     sampled_returns,
                     sampled_advantages,
@@ -549,7 +560,8 @@ class PPO:
 
                 # Compute per-critic clipped policy losses
                 if self._num_critics > 1:
-                    advantages = (sampled_advantages * self._critic_weights).sum(dim=-1, keepdim=True)
+                    effective_weights = self._critic_weights * self._active_mask
+                    advantages = (sampled_advantages * effective_weights).sum(dim=-1, keepdim=True)
                 else:
                     advantages = sampled_advantages
                 surr = advantages * ratio
@@ -572,11 +584,25 @@ class PPO:
                 if self._num_critics > 1:
                     value_losses = []
                     for i in range(self._num_critics):
-                        predicted_values_i = predicted_values[:, i]
-                        sampled_returns_i = sampled_returns[:, i]
-                        value_loss = self._value_loss_scale * F.mse_loss(sampled_returns_i, predicted_values_i)
-                        value_losses.append(value_loss)
-                    value_loss = sum(value_losses) / self._num_critics
+                        # Only compute loss if the mask for this critic is 1
+                        if self._active_mask[i] > 0:
+                            v_loss = self._value_loss_scale * F.mse_loss(
+                                predicted_values[:, i], 
+                                sampled_returns[:, i]
+                            )
+                            value_losses.append(v_loss)
+                        else:
+                            value_losses.append(torch.tensor(0.0, device=self.device))
+                    
+                    # # Average only over the active critics to keep loss scale consistent
+                    active_count = max(1, sum([1 for l in value_losses if l > 0]))
+                    value_loss = sum(value_losses) # / active_count
+                    # for i in range(self._num_critics):
+                    #     predicted_values_i = predicted_values[:, i]
+                    #     sampled_returns_i = sampled_returns[:, i]
+                    #     value_loss = self._value_loss_scale * F.mse_loss(sampled_returns_i, predicted_values_i)
+                    #     value_losses.append(value_loss)
+                    # value_loss = sum(value_losses) / self._num_critics
                 else:
                     value_loss = self._value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
                 
