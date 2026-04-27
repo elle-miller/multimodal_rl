@@ -142,6 +142,15 @@ class IsaacLabWrapper(object):
         """Parallel training envs (total minus eval slice used by :class:`Trainer`)."""
         return self.num_envs - self.num_eval_envs
 
+    @num_train_envs.setter
+    def num_train_envs(self, value: int) -> None:
+        """Align eval slice with training script (e.g. airec_rl :func:`train_one_seed`)."""
+        n = int(value)
+        self.num_eval_envs = self.num_envs - n
+        self.eval_env_ids = torch.arange(
+            self.num_eval_envs, dtype=torch.int64, device=self.device
+        )
+
     @property
     def observation_space(self) -> gymnasium.Space:
         """Observation space"""
