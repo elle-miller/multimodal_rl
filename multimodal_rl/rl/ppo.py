@@ -170,7 +170,12 @@ class PPO:
         adam_epsilon = 1e-5
         self.policy_optimiser = torch.optim.Adam(self.policy.parameters(), lr=self._learning_rate, eps=adam_epsilon)
         self.value_optimiser = torch.optim.Adam(self.value.parameters(), lr=self._learning_rate, eps=adam_epsilon)
-        self.encoder_optimiser = torch.optim.Adam(self.encoder.parameters(), lr=self._learning_rate, eps=adam_epsilon)
+        encoder_params = [p for p in self.encoder.parameters() if p.requires_grad]
+        self.encoder_optimiser = (
+            torch.optim.Adam(encoder_params, lr=self._learning_rate, eps=adam_epsilon)
+            if encoder_params
+            else None
+        )
 
         # Register modules for checkpointing
         if self.writer is not None:
@@ -179,7 +184,8 @@ class PPO:
             self.writer.checkpoint_modules["encoder"] = self.encoder
             self.writer.checkpoint_modules["policy_optimiser"] = self.policy_optimiser
             self.writer.checkpoint_modules["value_optimiser"] = self.value_optimiser
-            self.writer.checkpoint_modules["encoder_optimiser"] = self.encoder_optimiser
+            if self.encoder_optimiser is not None:
+                self.writer.checkpoint_modules["encoder_optimiser"] = self.encoder_optimiser
 
             if self.encoder.state_preprocessor is not None:
                 self.writer.checkpoint_modules["state_preprocessor"] = self.encoder.state_preprocessor
@@ -222,10 +228,11 @@ class PPO:
                         self.value_optimiser,
                         **filtered_kwargs
                     )
-                    self._learning_rate_schedulers["encoder"] = KLAdaptiveLR(
-                        self.encoder_optimiser,
-                        **filtered_kwargs
-                    )
+                    if self.encoder_optimiser is not None:
+                        self._learning_rate_schedulers["encoder"] = KLAdaptiveLR(
+                            self.encoder_optimiser,
+                            **filtered_kwargs
+                        )
             else:
                 # Standard PyTorch scheduler - apply to all optimizers
                 scheduler_class = scheduler_name_or_class
@@ -242,10 +249,11 @@ class PPO:
                     self.value_optimiser,
                     **scheduler_kwargs
                 )
-                self._learning_rate_schedulers["encoder"] = scheduler_class(
-                    self.encoder_optimiser,
-                    **scheduler_kwargs
-                )
+                if self.encoder_optimiser is not None:
+                    self._learning_rate_schedulers["encoder"] = scheduler_class(
+                        self.encoder_optimiser,
+                        **scheduler_kwargs
+                    )
 
         self.update_step = 0
         self.epoch_step = 0
@@ -618,7 +626,8 @@ class PPO:
                     aux_info = {}
 
                 # Optimization step
-                self.encoder_optimiser.zero_grad()
+                if self.encoder_optimiser is not None:
+                    self.encoder_optimiser.zero_grad()
                 self.policy_optimiser.zero_grad()
                 self.value_optimiser.zero_grad()
                 if self.ssl_task is not None:
@@ -646,7 +655,8 @@ class PPO:
                     )
 
                 # Update parameters
-                self.encoder_optimiser.step()
+                if self.encoder_optimiser is not None:
+                    self.encoder_optimiser.step()
                 self.policy_optimiser.step()
                 self.value_optimiser.step()
                 if self.ssl_task is not None:
@@ -694,7 +704,8 @@ class PPO:
                 self.tb_writer.add_scalar("value_loss", wandb_dict["Loss / Value loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("learning_rate/policy", self.policy_optimiser.param_groups[0]["lr"], global_step=self.update_step)
                 self.tb_writer.add_scalar("learning_rate/value", self.value_optimiser.param_groups[0]["lr"], global_step=self.update_step)
-                self.tb_writer.add_scalar("learning_rate/encoder", self.encoder_optimiser.param_groups[0]["lr"], global_step=self.update_step)
+                if self.encoder_optimiser is not None:
+                    self.tb_writer.add_scalar("learning_rate/encoder", self.encoder_optimiser.param_groups[0]["lr"], global_step=self.update_step)
 
             # Log SSL task metrics
             if self.ssl_task is not None:
@@ -747,7 +758,8 @@ class PPO:
             # Log learning rates for each optimizer
             wandb_dict["Learning Rate / Policy"] = self.policy_optimiser.param_groups[0]["lr"]
             wandb_dict["Learning Rate / Value"] = self.value_optimiser.param_groups[0]["lr"]
-            wandb_dict["Learning Rate / Encoder"] = self.encoder_optimiser.param_groups[0]["lr"]
+            if self.encoder_optimiser is not None:
+                wandb_dict["Learning Rate / Encoder"] = self.encoder_optimiser.param_groups[0]["lr"]
             
             self.wandb_session.log(wandb_dict)
 

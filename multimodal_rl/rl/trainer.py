@@ -4,6 +4,9 @@ Handles the main training loop, environment interaction, evaluation,
 checkpointing, and video logging for RL agents.
 """
 
+import math
+import os
+import re
 import sys
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -130,7 +133,12 @@ class EpisodeTracker:
     Accumulates scalar return, ``infos['log']`` diagnostics, and per-component
     ``infos['rewards']`` tensors (e.g. env ``extras['rewards']``), using the same
     active-episode mask as returns.
+
+    Completed-episode lengths (``episode_length_*`` in :meth:`get_mean_returns`)
+    aggregate every finished episode in the current eval window (between
+    :meth:`reset` calls), regardless of termination vs truncation.
     """
+
     num_eval_envs: int
     device: torch.device
     info_keys: list = field(default_factory=list)
@@ -141,8 +149,15 @@ class EpisodeTracker:
         # Returns tracking
         self.returns = torch.zeros((self.num_eval_envs, 1), device=self.device)
         self.unmasked_returns = torch.zeros((self.num_eval_envs, 1), device=self.device)
-        self.steps_to_term = torch.zeros((self.num_eval_envs, 1), device=self.device)
-        self.steps_to_trunc = torch.zeros((self.num_eval_envs, 1), device=self.device)
+        #: Control steps in the current episode per eval env (includes the terminal timestep).
+        self.episode_step_buf = torch.zeros(
+            (self.num_eval_envs, 1), dtype=torch.long, device=self.device
+        )
+        # Completed-episode lengths in the current eval window (any ``done``).
+        self._sum_ep_len = 0.0
+        self._count_ep = 0
+        self._min_ep_len = float("inf")
+        self._max_ep_len = float("-inf")
 
         # Per-step scalars from infos["log"] and infos["rewards"] (e.g. env extras)
         self.info_metrics = {
@@ -153,10 +168,10 @@ class EpisodeTracker:
             k: torch.zeros((self.num_eval_envs, 1), device=self.device)
             for k in self.reward_keys
         }
-        
+
         # Active episode mask (1 = active, 0 = done)
         self.active_mask = torch.ones((self.num_eval_envs, 1), device=self.device)
-    
+
     def update(
         self,
         rewards,
@@ -182,12 +197,25 @@ class EpisodeTracker:
         self.unmasked_returns += rewards
         self.returns += rewards * self.active_mask
 
-        done = terminated | truncated
-        self.active_mask *= (1 - done.float())
+        if terminated.dim() == 1:
+            terminated = terminated.unsqueeze(-1)
+        if truncated.dim() == 1:
+            truncated = truncated.unsqueeze(-1)
+        terminated_b = terminated.bool()
+        truncated_b = truncated.bool()
 
-        # Track steps until termination/truncation (increment for active episodes)
-        self.steps_to_term += self.active_mask * (1 - terminated.float())
-        self.steps_to_trunc += self.active_mask * (1 - truncated.float())
+        self.episode_step_buf += 1
+        done = terminated_b | truncated_b
+
+        if done.any():
+            lens = self.episode_step_buf[done]
+            self._sum_ep_len += float(lens.sum().item())
+            self._count_ep += int(done.sum().item())
+            self._min_ep_len = min(self._min_ep_len, float(lens.min().item()))
+            self._max_ep_len = max(self._max_ep_len, float(lens.max().item()))
+        self.episode_step_buf = torch.where(done, torch.zeros_like(self.episode_step_buf), self.episode_step_buf)
+
+        self.active_mask *= (1 - done.float())
 
         mask_weight = self.active_mask.mean().item()
 
@@ -217,8 +245,11 @@ class EpisodeTracker:
         """
         self.returns.zero_()
         self.unmasked_returns.zero_()
-        self.steps_to_term.zero_()
-        self.steps_to_trunc.zero_()
+        self.episode_step_buf.zero_()
+        self._sum_ep_len = 0.0
+        self._count_ep = 0
+        self._min_ep_len = float("inf")
+        self._max_ep_len = float("-inf")
         self.active_mask.fill_(1.0)
 
         if info_keys is not None:
@@ -243,6 +274,13 @@ class EpisodeTracker:
     
     def get_mean_returns(self):
         """Get mean returns across environments."""
+        nan = float("nan")
+        if self._count_ep:
+            ep_mean = self._sum_ep_len / self._count_ep
+            ep_min = self._min_ep_len
+            ep_max = self._max_ep_len
+        else:
+            ep_mean = ep_min = ep_max = nan
         return {
             "mean_returns": self.returns.mean().item(),
             "unmasked_returns": self.unmasked_returns.mean().item(),
@@ -250,8 +288,10 @@ class EpisodeTracker:
             "min_returns": self.returns.min().item(),
             "std_returns": self.returns.std().item(),
             "median_returns": self.returns.median().item(),
-            "steps_to_term": self.steps_to_term.mean().item(),
-            "steps_to_trunc": self.steps_to_trunc.mean().item(),
+            "episode_length_mean": ep_mean,
+            "episode_length_min": ep_min,
+            "episode_length_max": ep_max,
+            "num_episodes_completed": float(self._count_ep),
         }
     
     def get_mean_info(self):
@@ -352,7 +392,21 @@ class Trainer:
             f"Env reward width {rewards.shape[1]} does not match num_critics={n_critics}"
         )
 
-    def train(self, play=False, trial=None):
+    def _infer_global_step_from_checkpoint_path(self, checkpoint_path: str) -> int | None:
+        """Infer env-global-step from a checkpoint filename like ``agent_<timestep>.pt``."""
+        base = os.path.basename(checkpoint_path)
+        m = re.match(r"^agent_(\d+)\.pt$", base)
+        if not m:
+            return None
+        return int(m.group(1))
+
+    def train(
+        self,
+        play: bool = False,
+        trial=None,
+        resume_from_checkpoint: str | None = None,
+        resume_global_step: int | None = None,
+    ):
         """Execute main training loop.
         
         Runs the training loop with the following steps:
@@ -367,10 +421,48 @@ class Trainer:
         Args:
             play: If True, skip checkpoint saving (default: False).
             trial: Optuna trial for hyperparameter optimization (default: None).
+            resume_from_checkpoint: If provided, load agent state (policy/value/encoder/optimizers)
+                from this checkpoint path before training.
+            resume_global_step: If provided, resume logging/checkpoint step counters from this
+                env-global-step. If omitted and ``resume_from_checkpoint`` looks like
+                ``.../agent_<timestep>.pt``, the timestep will be inferred. Otherwise defaults to 0.
             
         Returns:
             Tuple of (best_return, should_prune) for Optuna integration.
         """
+        # Optional checkpoint resume (must happen before first eval snapshot).
+        timestep_offset = 0
+        if resume_from_checkpoint is not None:
+            self.agent.load(resume_from_checkpoint)
+            if resume_global_step is None:
+                resume_global_step = self._infer_global_step_from_checkpoint_path(
+                    resume_from_checkpoint
+                )
+            if resume_global_step is None:
+                resume_global_step = 0
+            if resume_global_step < 0:
+                raise ValueError(f"resume_global_step must be >= 0, got {resume_global_step}")
+            if resume_global_step % self.num_train_envs != 0:
+                raise ValueError(
+                    f"resume_global_step={resume_global_step} must be divisible by "
+                    f"num_train_envs={self.num_train_envs} (global_step = timestep * num_train_envs)"
+                )
+
+            timestep_offset = resume_global_step // self.num_train_envs
+            self.global_step = int(resume_global_step)
+
+            # Best-effort: align PPO's internal update counters used for update logging.
+            if hasattr(self.agent, "_rollouts") and hasattr(self.agent, "update_step"):
+                rollouts = int(self.agent._rollouts)
+                if rollouts > 0:
+                    self.agent.update_step = int(
+                        resume_global_step // (rollouts * self.num_train_envs)
+                    )
+                    if hasattr(self.agent, "global_step"):
+                        self.agent.global_step = int(
+                            self.agent.update_step * rollouts * self.num_train_envs
+                        )
+
         # Hard reset all environments to begin training
         states, infos = self.env.reset(hard=True)
         train_states, eval_states = self.split_train_eval_obs(states, self.num_eval_envs)
@@ -407,15 +499,18 @@ class Trainer:
         wandb_images = []
         best_return = 0.0
         rollout = 0
-        self.rl_update = 0
+        self.rl_update = int(getattr(self.agent, "update_step", 0))
         
         # Start first evaluation episode immediately with initial random policy
         self._snapshot_policy_for_eval()
 
         actions = torch.zeros((self.num_envs, self.agent.action_space.shape[0]), device=self.device)
 
+        if timestep_offset >= self.timesteps:
+            return best_return, False
+
         for timestep in tqdm.tqdm(
-            range(self.timesteps),
+            range(timestep_offset, self.timesteps),
             disable=self.disable_progressbar,
             file=sys.stdout,
         ):
@@ -561,6 +656,15 @@ class Trainer:
         if "counters" in infos:
             for k, v in infos["counters"].items():
                 if v is not None:
+                    # Per-env vectors (num_envs,); scalars can appear if env code wrongly reduced a 1D tensor.
+                    if isinstance(v, torch.Tensor) and v.ndim == 0:
+                        metric_value = v.detach().cpu()
+                        wandb_episode_dict[f"Eval episode counters / {k}"] = metric_value
+                        if self.writer.tb_writer is not None:
+                            self.writer.tb_writer.add_scalar(
+                                k, float(metric_value), global_step=self.global_step
+                            )
+                        continue
                     ve = v[: self.num_eval_envs]
                     # Per-episode minimum distance: mean() over parallel eval envs dilutes the metric
                     # (e.g. a few successes at ~0.03 m mixed with many failures at ~1 m → ~1 m mean).
@@ -613,7 +717,7 @@ class Trainer:
         # Log episode returns
         for k, v in returns.items():
             wandb_episode_dict[f"Eval episode returns / {k}"] = v
-            if self.writer.tb_writer is not None:
+            if self.writer.tb_writer is not None and isinstance(v, float) and math.isfinite(v):
                 self.writer.tb_writer.add_scalar(k, v, global_step=self.global_step)
 
         # Log reward components from infos["rewards"] (episode-accumulated in tracker)

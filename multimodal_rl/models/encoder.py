@@ -31,7 +31,7 @@ class Encoder(nn.Module):
         env_cfg: Environment configuration.
         config_dict: Configuration dictionary containing encoder settings:
             - method: Fusion method ("early" or "intermediate")
-            - hiddens: List of hidden layer sizes for final MLP
+            - hiddens: List of hidden layer sizes for final MLP (empty list = Identity; z_dim equals fused input size)
             - activations: List of activation functions
             - layernorm: Whether to use layer normalization
             - latent_state_dim: Latent dimension for intermediate fusion (default: 64)
@@ -94,8 +94,9 @@ class Encoder(nn.Module):
                     num_inputs += self.latent_state_dim
 
         self.num_inputs = num_inputs
-        self.num_outputs = self.hiddens[-1]
-        
+        # Empty hiddens uses MLP(...) -> Identity; z_dim matches fused observation size.
+        self.num_outputs = self.hiddens[-1] if self.hiddens else num_inputs
+
         # Final fusion MLP
         self.net = MLP(
             num_inputs,
