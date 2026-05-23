@@ -696,12 +696,14 @@ class PPO:
                 "global_step": self.update_step,
                 "Loss / Policy loss": cumulative_policy_loss / num_updates,
                 "Loss / Value loss": cumulative_value_loss / num_updates,
+                "Loss / Entropy loss": cumulative_entropy_loss / num_updates,
             }
 
             # Log to TensorBoard
             if self.tb_writer is not None:
                 self.tb_writer.add_scalar("policy_loss", wandb_dict["Loss / Policy loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("value_loss", wandb_dict["Loss / Value loss"], global_step=self.global_step)
+                self.tb_writer.add_scalar("entropy_loss", wandb_dict["Loss / Entropy loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("learning_rate/policy", self.policy_optimiser.param_groups[0]["lr"], global_step=self.update_step)
                 self.tb_writer.add_scalar("learning_rate/value", self.value_optimiser.param_groups[0]["lr"], global_step=self.update_step)
                 if self.encoder_optimiser is not None:

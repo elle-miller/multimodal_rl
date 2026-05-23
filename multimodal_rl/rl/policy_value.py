@@ -216,7 +216,8 @@ class GaussianPolicy(torch.nn.Module):
         """
         if self._distribution is None:
             return torch.tensor(0.0, device=self.device)
-        return self._distribution.entropy().to(self.device)
+        # return self._distribution.entropy().to(self.device)
+        return self._distribution.entropy().sum(dim=-1).unsqueeze(-1).to(self.device)
 
     def distribution(self, role: str = "") -> torch.distributions.Normal:
         """Get the current action distribution.
