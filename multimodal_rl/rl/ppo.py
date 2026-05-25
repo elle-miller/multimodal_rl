@@ -42,6 +42,8 @@ PPO_DEFAULT_CONFIG = {
     "time_limit_bootstrap": False,
     "multi_critic": None,  # Dict with keys: num_critics, gammas, weights, names. If None, single critic.
     "state_dependent_log_std": False,  # If True, log_std is computed from state; if False, uses learnable parameter
+    "stage_dependent_log_std": False,  # One log_std head per curriculum stage (requires state_dependent_log_std)
+    "num_log_std_stages": 1,
     "experiment": {
         "directory": "",
         "experiment_name": "",
@@ -155,8 +157,15 @@ class PPO:
             self._critic_weights = torch.ones(1, device=self.device, dtype=self.dtype)
             self._critic_names = ["default"]
 
-        # Check if policy uses state-dependent log_std (from config or by inspecting policy)
-        self._state_dependent_log_std = self.cfg.get("state_dependent_log_std", False)
+        # Check if policy uses state-dependent / stage-dependent log_std
+        self._state_dependent_log_std = self.cfg.get(
+            "state_dependent_log_std",
+            getattr(policy, "_state_dependent_log_std", False),
+        )
+        self._stage_dependent_log_std = self.cfg.get(
+            "stage_dependent_log_std",
+            getattr(policy, "_stage_dependent_log_std", False),
+        )
 
         # Networks
         self.policy = policy
@@ -287,15 +296,24 @@ class PPO:
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=self.dtype)
             self.memory.create_tensor(name="advantages", size=self._num_critics, dtype=self.dtype)
+            if self._stage_dependent_log_std:
+                self.memory.create_tensor(name="task_stage", size=1, dtype=torch.int64)
 
             self._tensors_names = self.observation_names + [
                 "actions",
-                "log_prob",
-                "rewards",
-                "values",
-                "returns",
-                "advantages",
             ]
+            if self._stage_dependent_log_std:
+                self._tensors_names.append("task_stage")
+            self._tensors_names.extend(
+                [
+                    "log_prob",
+                    "rewards",
+                    "values",
+                    "returns",
+                    "advantages",
+                ]
+            )
+            self._minibatch_size = 7 + (1 if self._stage_dependent_log_std else 0)
 
         self._current_next_states = None
         self._active_mask = None
@@ -311,6 +329,7 @@ class PPO:
         terminated: torch.Tensor,
         truncated: torch.Tensor,
         timestep: int,
+        task_stage: Optional[torch.Tensor] = None,
     ) -> None:
         """Record an environment transition in memory.
         
@@ -358,7 +377,7 @@ class PPO:
                 rewards += self._discount_factor * values * truncated
 
         # Store transition in memory
-        self.memory.add_samples(
+        transition = dict(
             sample_type="parallel",
             states={"policy": states["policy"]},
             actions=actions,
@@ -369,6 +388,11 @@ class PPO:
             log_prob=log_prob,
             values=values,
         )
+        if self._stage_dependent_log_std:
+            if task_stage is None:
+                raise ValueError("task_stage is required when stage_dependent_log_std=True")
+            transition["task_stage"] = task_stage.view(-1, 1).to(dtype=torch.int64)
+        self.memory.add_samples(**transition)
 
     def compute_gae(self, rewards: torch.Tensor,
             dones: torch.Tensor,
@@ -504,6 +528,9 @@ class PPO:
         # Initialize loss accumulators
         cumulative_policy_loss = 0.0
         cumulative_entropy_loss = 0.0
+        cumulative_entropy_loss_by_stage = {}
+        cumulative_policy_stddev_by_head = {}
+        cumulative_policy_stddev_by_stage = {}
         cumulative_value_loss = 0.0
         cumulative_aux_loss = 0.0
 
@@ -521,18 +548,23 @@ class PPO:
 
             # Mini-batches loop
             for i, minibatch in enumerate(sampled_batches):
-                if len(minibatch) != 7:
-                    raise ValueError(f"Expected 7 elements in minibatch, got {len(minibatch)}")
-                
-                (
-                    sampled_states,
-                    sampled_actions,
-                    sampled_log_prob,
-                    sampled_rewards,
-                    sampled_values,
-                    sampled_returns,
-                    sampled_advantages,
-                ) = minibatch
+                if len(minibatch) != self._minibatch_size:
+                    raise ValueError(
+                        f"Expected {self._minibatch_size} elements in minibatch, got {len(minibatch)}"
+                    )
+
+                sampled_states = minibatch[0]
+                sampled_actions = minibatch[1]
+                idx = 2
+                sampled_task_stage = None
+                if self._stage_dependent_log_std:
+                    sampled_task_stage = minibatch[idx].view(-1).long()
+                    idx += 1
+                sampled_log_prob = minibatch[idx]
+                sampled_rewards = minibatch[idx + 1]
+                sampled_values = minibatch[idx + 2]
+                sampled_returns = minibatch[idx + 3]
+                sampled_advantages = minibatch[idx + 4]
 
                 sampled_states = {"policy": sampled_states}
 
@@ -544,8 +576,12 @@ class PPO:
                 # train only for first epoch
                 z_policy = self.encoder(sampled_states, train=not epoch)
                 z_policy.requires_grad_(True)
-                _, next_log_prob, _ = self.policy.act(z_policy, taken_actions=sampled_actions)
-                
+                _, next_log_prob, _ = self.policy.act(
+                    z_policy,
+                    taken_actions=sampled_actions,
+                    task_stage=sampled_task_stage,
+                )
+
                 # Compute approximate KL divergence for early stopping
                 with torch.no_grad():
                     ratio = next_log_prob - sampled_log_prob
@@ -556,7 +592,7 @@ class PPO:
                 if self._kl_threshold > 0 and kl_divergence > self._kl_threshold:
                     break
 
-                # Compute entropy loss
+                # Entropy bonus (uses distribution built in act(), including stage log_std head)
                 entropy_loss = (
                     -self._entropy_loss_scale * self.policy.get_entropy().mean()
                     if self._entropy_loss_scale > 0
@@ -671,6 +707,28 @@ class PPO:
 
                 if self._entropy_loss_scale > 0:
                     cumulative_entropy_loss += entropy_loss.item()
+                    if self._stage_dependent_log_std and sampled_task_stage is not None:
+                        for stage_idx, stage_ent_loss in self.policy.get_per_stage_entropy_losses(
+                            self.policy.get_entropy(),
+                            sampled_task_stage,
+                            self._entropy_loss_scale,
+                        ).items():
+                            cumulative_entropy_loss_by_stage[stage_idx] = (
+                                cumulative_entropy_loss_by_stage.get(stage_idx, 0.0) + stage_ent_loss
+                            )
+
+                if self._stage_dependent_log_std:
+                    for stage_idx, std in self.policy.get_per_head_policy_stddev(z_policy).items():
+                        cumulative_policy_stddev_by_head[stage_idx] = (
+                            cumulative_policy_stddev_by_head.get(stage_idx, 0.0) + std
+                        )
+                    if sampled_task_stage is not None:
+                        for stage_idx, std in self.policy.get_per_stage_policy_stddev(
+                            sampled_task_stage
+                        ).items():
+                            cumulative_policy_stddev_by_stage[stage_idx] = (
+                                cumulative_policy_stddev_by_stage.get(stage_idx, 0.0) + std
+                            )
 
             # Update learning rate schedulers if specified
             if self._learning_rate_schedulers:
@@ -698,12 +756,20 @@ class PPO:
                 "Loss / Value loss": cumulative_value_loss / num_updates,
                 "Loss / Entropy loss": cumulative_entropy_loss / num_updates,
             }
+            for stage_idx, stage_ent_loss in cumulative_entropy_loss_by_stage.items():
+                wandb_dict[f"Loss / Entropy loss stage{stage_idx}"] = stage_ent_loss / num_updates
 
             # Log to TensorBoard
             if self.tb_writer is not None:
                 self.tb_writer.add_scalar("policy_loss", wandb_dict["Loss / Policy loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("value_loss", wandb_dict["Loss / Value loss"], global_step=self.global_step)
                 self.tb_writer.add_scalar("entropy_loss", wandb_dict["Loss / Entropy loss"], global_step=self.global_step)
+                for stage_idx, stage_ent_loss in cumulative_entropy_loss_by_stage.items():
+                    self.tb_writer.add_scalar(
+                        f"entropy_loss_stage{stage_idx}",
+                        stage_ent_loss / num_updates,
+                        global_step=self.global_step,
+                    )
                 self.tb_writer.add_scalar("learning_rate/policy", self.policy_optimiser.param_groups[0]["lr"], global_step=self.update_step)
                 self.tb_writer.add_scalar("learning_rate/value", self.value_optimiser.param_groups[0]["lr"], global_step=self.update_step)
                 if self.encoder_optimiser is not None:
@@ -755,8 +821,40 @@ class PPO:
                 })
 
             # Log policy standard deviation
-            wandb_dict["Policy / Standard deviation"] = self.policy.distribution().stddev.mean().item()
-            
+            if self._stage_dependent_log_std and cumulative_policy_stddev_by_head:
+                for stage_idx, std in cumulative_policy_stddev_by_head.items():
+                    wandb_dict[f"Policy / Standard deviation head{stage_idx}"] = std / num_updates
+                for stage_idx, std in cumulative_policy_stddev_by_stage.items():
+                    wandb_dict[f"Policy / Standard deviation stage{stage_idx}"] = std / num_updates
+                wandb_dict["Policy / Standard deviation"] = sum(
+                    cumulative_policy_stddev_by_head.values()
+                ) / (num_updates * len(cumulative_policy_stddev_by_head))
+            else:
+                dist = self.policy.distribution()
+                wandb_dict["Policy / Standard deviation"] = (
+                    dist.stddev.mean().item() if dist is not None else 0.0
+                )
+
+            if self.tb_writer is not None:
+                self.tb_writer.add_scalar(
+                    "policy_stddev",
+                    wandb_dict["Policy / Standard deviation"],
+                    global_step=self.global_step,
+                )
+                if self._stage_dependent_log_std:
+                    for stage_idx, std in cumulative_policy_stddev_by_head.items():
+                        self.tb_writer.add_scalar(
+                            f"policy_stddev_head{stage_idx}",
+                            std / num_updates,
+                            global_step=self.global_step,
+                        )
+                    for stage_idx, std in cumulative_policy_stddev_by_stage.items():
+                        self.tb_writer.add_scalar(
+                            f"policy_stddev_stage{stage_idx}",
+                            std / num_updates,
+                            global_step=self.global_step,
+                        )
+
             # Log learning rates for each optimizer
             wandb_dict["Learning Rate / Policy"] = self.policy_optimiser.param_groups[0]["lr"]
             wandb_dict["Learning Rate / Value"] = self.value_optimiser.param_groups[0]["lr"]

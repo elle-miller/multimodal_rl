@@ -527,7 +527,10 @@ class Trainer:
                 
                 # Training: live policy
                 train_z = self.encoder(train_states)
-                train_actions, train_log_prob, _ = self.agent.policy.act(train_z)
+                train_task_stage = self._get_train_task_stages()
+                train_actions, train_log_prob, _ = self.agent.policy.act(
+                    train_z, task_stage=train_task_stage
+                )
 
                 # Combine actions from eval and training environments
                 actions[: self.num_eval_envs] = eval_actions.detach()
@@ -551,6 +554,7 @@ class Trainer:
                     terminated[self.num_eval_envs :, :],
                     truncated[self.num_eval_envs :, :],
                     infos,
+                    task_stage=train_task_stage,
                 )
         
                 # Update episode tracker
@@ -779,8 +783,24 @@ class Trainer:
             depth_color = depth_color.transpose(0, 3, 1, 2)  # [T, H, W, 3] -> [T, C, H, W]
             wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
 
+    def _get_train_task_stages(self):
+        """Current curriculum stage indices for training envs (before env.step)."""
+        if not getattr(self.agent.policy, "_stage_dependent_log_std", False):
+            return None
+        env_unwrapped = getattr(self.env, "_unwrapped", self.env.env.unwrapped)
+        return env_unwrapped._task_stage[self.num_eval_envs :].long()
+
     def save_transition_to_memory(
-        self, states, actions, log_prob, rewards, next_states, terminated, truncated, infos
+        self,
+        states,
+        actions,
+        log_prob,
+        rewards,
+        next_states,
+        terminated,
+        truncated,
+        infos,
+        task_stage=None,
     ):
         """Save transition to memory buffers and update evaluation metrics.
         
@@ -821,6 +841,7 @@ class Trainer:
             terminated=terminated,
             truncated=truncated,
             timestep=self.global_step,
+            task_stage=task_stage,
         )
 
     def split_train_eval_obs(self, obs, n):

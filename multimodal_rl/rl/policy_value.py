@@ -52,6 +52,10 @@ class GaussianPolicy(torch.nn.Module):
             "sum", "mean", "prod", or "none" (default: "sum").
         state_dependent_log_std: If True, log_std is computed from state via a head;
             if False, uses a learnable parameter (default: False).
+        stage_dependent_log_std: If True (requires state_dependent_log_std), use one
+            log_std head per curriculum stage and select by ``task_stage`` in :meth:`act`.
+        num_log_std_stages: Number of stage-specific log_std heads when
+            stage_dependent_log_std is True (default: 1).
     """
 
     def __init__(
@@ -69,6 +73,8 @@ class GaussianPolicy(torch.nn.Module):
         activations: list = ["elu", "elu", "elu", "tanh"],
         reduction: str = "sum",
         state_dependent_log_std: bool = False,
+        stage_dependent_log_std: bool = False,
+        num_log_std_stages: int = 1,
     ) -> None:
         super().__init__()
 
@@ -78,6 +84,10 @@ class GaussianPolicy(torch.nn.Module):
         self.observation_space = observation_space
         self.action_space = action_space
         self._state_dependent_log_std = state_dependent_log_std
+        if stage_dependent_log_std and not state_dependent_log_std:
+            raise ValueError("stage_dependent_log_std requires state_dependent_log_std=True")
+        self._stage_dependent_log_std = stage_dependent_log_std
+        self._num_log_std_stages = num_log_std_stages
 
         num_actions = action_space.shape[0]
 
@@ -91,8 +101,12 @@ class GaussianPolicy(torch.nn.Module):
             _ACTIVATIONS[activations[-1]] # Only add this if your actions are strictly [-1, 1]
         ).to(device)
         
-        # Initialize log_std: either as parameter or network head
-        if state_dependent_log_std:
+        # Initialize log_std: parameter, single head, or one head per curriculum stage
+        if state_dependent_log_std and stage_dependent_log_std:
+            self.log_std_heads = nn.ModuleList(
+                [nn.Linear(hiddens[-1], num_actions).to(device) for _ in range(num_log_std_stages)]
+            )
+        elif state_dependent_log_std:
             self.log_std_head = nn.Linear(hiddens[-1], num_actions).to(device)
         else:
             # Use learnable parameter
@@ -107,7 +121,11 @@ class GaussianPolicy(torch.nn.Module):
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=0.01)
                 nn.init.constant_(layer.bias, 0.0)
-        if state_dependent_log_std:
+        if state_dependent_log_std and stage_dependent_log_std:
+            for head in self.log_std_heads:
+                nn.init.orthogonal_(head.weight, gain=0.01)
+                nn.init.constant_(head.bias, 0.0)
+        elif state_dependent_log_std:
             nn.init.orthogonal_(self.log_std_head.weight, gain=0.01)
             nn.init.constant_(self.log_std_head.bias, 0.0)
 
@@ -138,8 +156,32 @@ class GaussianPolicy(torch.nn.Module):
             "none": None
         }[reduction]
 
+    def _log_std_from_features(
+        self, x: torch.Tensor, task_stage: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute log_std from hidden features, optionally per curriculum stage."""
+        if self._stage_dependent_log_std:
+            if task_stage is None:
+                raise ValueError("task_stage is required when stage_dependent_log_std=True")
+            task_stage = task_stage.view(-1).long().to(device=x.device)
+            if task_stage.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"task_stage batch size {task_stage.shape[0]} != features batch size {x.shape[0]}"
+                )
+            task_stage = task_stage.clamp(0, self._num_log_std_stages - 1)
+            log_stds = torch.stack([head(x) for head in self.log_std_heads], dim=1)
+            return log_stds[torch.arange(x.shape[0], device=x.device), task_stage]
+        if self._state_dependent_log_std:
+            return self.log_std_head(x)
+        batch_size = x.shape[0]
+        return self.log_std_parameter.unsqueeze(0).expand(batch_size, -1)
+
     def act(
-        self, z, taken_actions=None, deterministic=False
+        self,
+        z,
+        taken_actions=None,
+        deterministic=False,
+        task_stage: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Mapping[str, torch.Tensor]]:
         """Sample actions from the policy distribution.
         
@@ -170,12 +212,7 @@ class GaussianPolicy(torch.nn.Module):
             return mean_actions, None, outputs
 
         # Get and optionally clip log standard deviation
-        if self._state_dependent_log_std:
-            log_std = self.log_std_head(x)
-        else:
-            # Use learnable parameter and expand to match batch size
-            batch_size = mean_actions.shape[0]
-            log_std = self.log_std_parameter.unsqueeze(0).expand(batch_size, -1)  # Shape: (batch_size, num_actions)
+        log_std = self._log_std_from_features(x, task_stage=task_stage)
         
         if self._clip_log_std:
             log_std = torch.clamp(log_std, self._log_std_min, self._log_std_max)
@@ -205,18 +242,77 @@ class GaussianPolicy(torch.nn.Module):
         outputs["mean_actions"] = mean_actions
         return actions, log_prob, outputs
 
+    def get_per_stage_entropy_losses(
+        self,
+        entropy: torch.Tensor,
+        task_stage: torch.Tensor,
+        entropy_loss_scale: float,
+    ) -> dict[int, float]:
+        """Per-stage mean entropy loss using the active head's entropy from :meth:`act`."""
+        if not self._stage_dependent_log_std or entropy_loss_scale <= 0:
+            return {}
+        entropy = entropy.reshape(-1)
+        task_stage = task_stage.reshape(-1).long().to(device=entropy.device)
+        if entropy.shape[0] != task_stage.shape[0]:
+            raise ValueError(
+                f"entropy has {entropy.shape[0]} samples but task_stage has {task_stage.shape[0]}"
+            )
+        losses = {}
+        for stage_idx in range(self._num_log_std_stages):
+            mask = task_stage == stage_idx
+            if mask.any():
+                losses[stage_idx] = (-entropy_loss_scale * entropy[mask].mean()).item()
+        return losses
+
+    def get_per_head_policy_stddev(self, z: torch.Tensor) -> dict[int, float]:
+        """Mean policy stddev per log_std head (batch and action mean, logging only)."""
+        if not self._stage_dependent_log_std:
+            return {}
+        with torch.no_grad():
+            x = self.policy_net(z)
+            stddev_by_head = {}
+            for stage_idx, head in enumerate(self.log_std_heads):
+                log_std = head(x)
+                if self._clip_log_std:
+                    log_std = torch.clamp(log_std, self._log_std_min, self._log_std_max)
+                stddev_by_head[stage_idx] = log_std.exp().mean().item()
+            return stddev_by_head
+
+    def get_per_stage_policy_stddev(self, task_stage: torch.Tensor) -> dict[int, float]:
+        """Mean policy stddev per stage from the last :meth:`act` distribution (masked by task_stage)."""
+        if self._distribution is None or not self._stage_dependent_log_std:
+            return {}
+        with torch.no_grad():
+            stddev = self._distribution.stddev.mean(dim=-1).reshape(-1)
+            task_stage = task_stage.reshape(-1).long().to(device=stddev.device)
+            if stddev.shape[0] != task_stage.shape[0]:
+                raise ValueError(
+                    f"stddev has {stddev.shape[0]} samples but task_stage has {task_stage.shape[0]}"
+                )
+            stddev_by_stage = {}
+            for stage_idx in range(self._num_log_std_stages):
+                mask = task_stage == stage_idx
+                if mask.any():
+                    stddev_by_stage[stage_idx] = stddev[mask].mean().item()
+            return stddev_by_stage
+
     def get_entropy(self, role: str = "") -> torch.Tensor:
-        """Compute entropy of the current policy distribution.
-        
+        """Entropy of :attr:`_distribution` from the last :meth:`act` call.
+
+        Uses the same action-dimension reduction as log-probability (e.g. sum).
+
         Args:
             role: Unused, kept for API compatibility.
-            
+
         Returns:
-            Entropy tensor of shape (batch_size, num_actions).
+            Per-sample entropy, shape ``(batch_size,)`` or ``(batch_size, 1)``.
         """
         if self._distribution is None:
             return torch.tensor(0.0, device=self.device)
+        #         return self._distribution.entropy().sum(dim=-1).unsqueeze(-1).to(self.device)
+        # old
         # return self._distribution.entropy().to(self.device)
+        # new
         return self._distribution.entropy().sum(dim=-1).unsqueeze(-1).to(self.device)
 
     def distribution(self, role: str = "") -> torch.distributions.Normal:
