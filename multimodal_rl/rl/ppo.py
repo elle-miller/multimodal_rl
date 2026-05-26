@@ -41,6 +41,8 @@ PPO_DEFAULT_CONFIG = {
     "kl_threshold": 0,
     "time_limit_bootstrap": False,
     "multi_critic": None,  # Dict with keys: num_critics, gammas, weights, names. If None, single critic.
+    "stage_dependent_mean": False,  # One mean head per curriculum stage
+    "num_mean_stages": 1,
     "state_dependent_log_std": False,  # If True, log_std is computed from state; if False, uses learnable parameter
     "stage_dependent_log_std": False,  # One log_std head per curriculum stage (requires state_dependent_log_std)
     "num_log_std_stages": 1,
@@ -166,6 +168,11 @@ class PPO:
             "stage_dependent_log_std",
             getattr(policy, "_stage_dependent_log_std", False),
         )
+        self._stage_dependent_mean = self.cfg.get(
+            "stage_dependent_mean",
+            getattr(policy, "_stage_dependent_mean", False),
+        )
+        self._requires_task_stage = self._stage_dependent_log_std or self._stage_dependent_mean
 
         # Networks
         self.policy = policy
@@ -296,13 +303,13 @@ class PPO:
             self.memory.create_tensor(name="truncated", size=1, dtype=torch.bool)
             self.memory.create_tensor(name="log_prob", size=1, dtype=self.dtype)
             self.memory.create_tensor(name="advantages", size=self._num_critics, dtype=self.dtype)
-            if self._stage_dependent_log_std:
+            if self._requires_task_stage:
                 self.memory.create_tensor(name="task_stage", size=1, dtype=torch.int64)
 
             self._tensors_names = self.observation_names + [
                 "actions",
             ]
-            if self._stage_dependent_log_std:
+            if self._requires_task_stage:
                 self._tensors_names.append("task_stage")
             self._tensors_names.extend(
                 [
@@ -313,7 +320,7 @@ class PPO:
                     "advantages",
                 ]
             )
-            self._minibatch_size = 7 + (1 if self._stage_dependent_log_std else 0)
+            self._minibatch_size = 7 + (1 if self._requires_task_stage else 0)
 
         self._current_next_states = None
         self._active_mask = None
@@ -388,9 +395,9 @@ class PPO:
             log_prob=log_prob,
             values=values,
         )
-        if self._stage_dependent_log_std:
+        if self._requires_task_stage:
             if task_stage is None:
-                raise ValueError("task_stage is required when stage_dependent_log_std=True")
+                raise ValueError("task_stage is required for stage-dependent policy heads")
             transition["task_stage"] = task_stage.view(-1, 1).to(dtype=torch.int64)
         self.memory.add_samples(**transition)
 
@@ -557,7 +564,7 @@ class PPO:
                 sampled_actions = minibatch[1]
                 idx = 2
                 sampled_task_stage = None
-                if self._stage_dependent_log_std:
+                if self._requires_task_stage:
                     sampled_task_stage = minibatch[idx].view(-1).long()
                     idx += 1
                 sampled_log_prob = minibatch[idx]

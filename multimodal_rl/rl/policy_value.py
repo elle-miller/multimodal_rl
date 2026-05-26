@@ -47,9 +47,20 @@ class GaussianPolicy(torch.nn.Module):
         min_log_std: Minimum log standard deviation if clipping enabled (default: -20).
         max_log_std: Maximum log standard deviation if clipping enabled (default: 2).
         hiddens: List of hidden layer sizes (default: [256, 128, 64]).
-        activations: List of activation function names (default: ["elu", "elu", "elu", "tanh"]).
+        activations: List of activation function names. With a single global mean
+            head, this includes the final action activation. With
+            stage_dependent_mean=True, this configures only the shared policy
+            hidden layers; the final action activation belongs to
+            stage_mean_activations.
         reduction: How to reduce log probability across action dimensions:
             "sum", "mean", "prod", or "none" (default: "sum").
+        stage_dependent_mean: If True, use one mean head per curriculum stage and
+            select by ``task_stage`` in :meth:`act`.
+        num_mean_stages: Number of stage-specific mean heads when
+            stage_dependent_mean is True (default: 1).
+        stage_mean_hiddens: Hidden layer sizes for each stage-specific mean head.
+        stage_mean_activations: Activations for each stage-specific mean head,
+            including the final action activation.
         state_dependent_log_std: If True, log_std is computed from state via a head;
             if False, uses a learnable parameter (default: False).
         stage_dependent_log_std: If True (requires state_dependent_log_std), use one
@@ -71,6 +82,10 @@ class GaussianPolicy(torch.nn.Module):
         max_log_std: float = 2,
         hiddens: list = [256, 128, 64],
         activations: list = ["elu", "elu", "elu", "tanh"],
+        stage_dependent_mean: bool = False,
+        num_mean_stages: int = 1,
+        stage_mean_hiddens: Optional[List[int]] = None,
+        stage_mean_activations: Optional[List[str]] = None,
         reduction: str = "sum",
         state_dependent_log_std: bool = False,
         stage_dependent_log_std: bool = False,
@@ -83,6 +98,8 @@ class GaussianPolicy(torch.nn.Module):
         )
         self.observation_space = observation_space
         self.action_space = action_space
+        self._stage_dependent_mean = stage_dependent_mean
+        self._num_mean_stages = num_mean_stages
         self._state_dependent_log_std = state_dependent_log_std
         if stage_dependent_log_std and not state_dependent_log_std:
             raise ValueError("stage_dependent_log_std requires state_dependent_log_std=True")
@@ -90,24 +107,60 @@ class GaussianPolicy(torch.nn.Module):
         self._num_log_std_stages = num_log_std_stages
 
         num_actions = action_space.shape[0]
+        self.num_actions = num_actions
 
-        # Build policy network
+        # Build shared policy network. The old single-head path keeps the final
+        # action activation in ``activations``; stage-specific mean heads own
+        # their final activation via ``stage_mean_activations``.
         hiddens = hiddens.copy()
-        self.policy_net = MLP(z_dim, hiddens, activations[:-1]).to(device)
+        if stage_dependent_mean:
+            if stage_mean_activations is None and len(activations) == len(hiddens) + 1:
+                shared_activations = activations[:-1]
+                stage_mean_activations = [activations[-1]]
+            else:
+                shared_activations = activations
+        else:
+            shared_activations = activations[:-1]
+        self.policy_net = MLP(z_dim, hiddens, shared_activations).to(device)
+        policy_output_dim = hiddens[-1] if hiddens else z_dim
 
-        # Mean head: Gain 0.01 for exploration
-        self.mean_head = nn.Sequential(
-            nn.Linear(hiddens[-1], num_actions),
-            _ACTIVATIONS[activations[-1]] # Only add this if your actions are strictly [-1, 1]
-        ).to(device)
+        # Mean head(s): shared policy features followed by either one global head
+        # or one stage-specific head selected by task_stage.
+        if stage_dependent_mean:
+            if num_mean_stages < 1:
+                raise ValueError("num_mean_stages must be >= 1")
+            stage_mean_hiddens = [] if stage_mean_hiddens is None else stage_mean_hiddens.copy()
+            stage_mean_activations = (
+                ["tanh"]
+                if stage_mean_activations is None
+                else stage_mean_activations.copy()
+            )
+            self.mean_heads = nn.ModuleList(
+                [
+                    self._make_mean_head(
+                        policy_output_dim,
+                        num_actions,
+                        stage_mean_hiddens,
+                        stage_mean_activations,
+                    ).to(device)
+                    for _ in range(num_mean_stages)
+                ]
+            )
+        else:
+            self.mean_head = self._make_mean_head(
+                policy_output_dim,
+                num_actions,
+                [],
+                [activations[-1]],
+            ).to(device)
         
         # Initialize log_std: parameter, single head, or one head per curriculum stage
         if state_dependent_log_std and stage_dependent_log_std:
             self.log_std_heads = nn.ModuleList(
-                [nn.Linear(hiddens[-1], num_actions).to(device) for _ in range(num_log_std_stages)]
+                [nn.Linear(policy_output_dim, num_actions).to(device) for _ in range(num_log_std_stages)]
             )
         elif state_dependent_log_std:
-            self.log_std_head = nn.Linear(hiddens[-1], num_actions).to(device)
+            self.log_std_head = nn.Linear(policy_output_dim, num_actions).to(device)
         else:
             # Use learnable parameter
             self.log_std_parameter = nn.Parameter(
@@ -117,10 +170,11 @@ class GaussianPolicy(torch.nn.Module):
 
         # orthogonal initialization with gain 0.01 for the last layer
         self.policy_net.apply(init_ppo_weights)
-        for layer in self.mean_head:
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=0.01)
-                nn.init.constant_(layer.bias, 0.0)
+        if stage_dependent_mean:
+            for head in self.mean_heads:
+                self._init_mean_head(head)
+        else:
+            self._init_mean_head(self.mean_head)
         if state_dependent_log_std and stage_dependent_log_std:
             for head in self.log_std_heads:
                 nn.init.orthogonal_(head.weight, gain=0.01)
@@ -155,6 +209,59 @@ class GaussianPolicy(torch.nn.Module):
             "prod": torch.prod,
             "none": None
         }[reduction]
+
+    def _make_mean_head(
+        self,
+        input_dim: int,
+        num_actions: int,
+        hiddens: List[int],
+        activations: List[str],
+    ) -> nn.Sequential:
+        """Build a mean head with optional private hidden layers."""
+        if len(activations) != len(hiddens) + 1:
+            raise ValueError(
+                "stage_mean_activations must have one activation per hidden layer "
+                "plus one final action activation"
+            )
+        layers = []
+        if hiddens:
+            # Use _modules.values() rather than children(): children() de-duplicates
+            # repeated activation module instances, which can silently drop ELUs.
+            layers.extend(MLP(input_dim, hiddens, activations[:-1])._modules.values())
+            input_dim = hiddens[-1]
+        layers.append(nn.Linear(input_dim, num_actions))
+        layers.append(_ACTIVATIONS[activations[-1]])
+        return nn.Sequential(*layers)
+
+    def _init_mean_head(self, head: nn.Sequential) -> None:
+        """Initialize private head hidden layers normally and final mean layer gently."""
+        linear_layers = [module for module in head.modules() if isinstance(module, nn.Linear)]
+        for layer in linear_layers[:-1]:
+            init_ppo_weights(layer)
+        if linear_layers:
+            nn.init.orthogonal_(linear_layers[-1].weight, gain=0.01)
+            nn.init.constant_(linear_layers[-1].bias, 0.0)
+
+    def _mean_from_features(
+        self, x: torch.Tensor, task_stage: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute mean actions from shared policy features, optionally per stage."""
+        if self._stage_dependent_mean:
+            if task_stage is None:
+                raise ValueError("task_stage is required when stage_dependent_mean=True")
+            task_stage = task_stage.view(-1).long().to(device=x.device)
+            if task_stage.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"task_stage batch size {task_stage.shape[0]} != features batch size {x.shape[0]}"
+                )
+            task_stage = task_stage.clamp(0, self._num_mean_stages - 1)
+            mean_actions = x.new_empty((x.shape[0], self.num_actions))
+            for stage_idx, head in enumerate(self.mean_heads):
+                mask = task_stage == stage_idx
+                if mask.any():
+                    mean_actions[mask] = head(x[mask])
+            return mean_actions
+        return self.mean_head(x)
 
     def _log_std_from_features(
         self, x: torch.Tensor, task_stage: Optional[torch.Tensor] = None
@@ -204,9 +311,9 @@ class GaussianPolicy(torch.nn.Module):
             torch.Size([32, 8]) torch.Size([32, 1])
         """
         x = self.policy_net(z)
-        mean_actions = self.mean_head(x)
+        mean_actions = self._mean_from_features(x, task_stage=task_stage)
         
-        outputs = {}
+        outputs = {"mean_actions": mean_actions}
 
         if deterministic:
             return mean_actions, None, outputs
@@ -239,7 +346,6 @@ class GaussianPolicy(torch.nn.Module):
         if self._clip_actions:
             actions = torch.clamp(actions, self._clip_actions_min, self._clip_actions_max)
 
-        outputs["mean_actions"] = mean_actions
         return actions, log_prob, outputs
 
     def get_per_stage_entropy_losses(

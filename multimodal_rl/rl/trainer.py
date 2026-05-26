@@ -523,7 +523,10 @@ class Trainer:
 
                 # Evaluation: use frozen snapshot for consistent policy
                 eval_z = self.eval_encoder(eval_states)
-                eval_actions, _, _ = self.eval_policy.act(eval_z, deterministic=True)
+                eval_task_stage = self._get_eval_task_stages()
+                eval_actions, _, _ = self.eval_policy.act(
+                    eval_z, deterministic=True, task_stage=eval_task_stage
+                )
                 
                 # Training: live policy
                 train_z = self.encoder(train_states)
@@ -783,12 +786,29 @@ class Trainer:
             depth_color = depth_color.transpose(0, 3, 1, 2)  # [T, H, W, 3] -> [T, C, H, W]
             wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
 
-    def _get_train_task_stages(self):
-        """Current curriculum stage indices for training envs (before env.step)."""
-        if not getattr(self.agent.policy, "_stage_dependent_log_std", False):
+    def _policy_requires_task_stage(self):
+        policy = self.agent.policy
+        return bool(
+            getattr(policy, "_stage_dependent_mean", False)
+            or getattr(policy, "_stage_dependent_log_std", False)
+        )
+
+    def _get_task_stages(self, start: int, end=None):
+        """Current curriculum stage indices for a slice of envs (before env.step)."""
+        if not self._policy_requires_task_stage():
             return None
         env_unwrapped = getattr(self.env, "_unwrapped", self.env.env.unwrapped)
-        return env_unwrapped._task_stage[self.num_eval_envs :].long()
+        if end is None:
+            return env_unwrapped._task_stage[start:].long()
+        return env_unwrapped._task_stage[start:end].long()
+
+    def _get_eval_task_stages(self):
+        """Current curriculum stage indices for evaluation envs (before env.step)."""
+        return self._get_task_stages(0, self.num_eval_envs)
+
+    def _get_train_task_stages(self):
+        """Current curriculum stage indices for training envs (before env.step)."""
+        return self._get_task_stages(self.num_eval_envs)
 
     def save_transition_to_memory(
         self,
