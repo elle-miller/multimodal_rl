@@ -276,8 +276,12 @@ class GaussianPolicy(torch.nn.Module):
                     f"task_stage batch size {task_stage.shape[0]} != features batch size {x.shape[0]}"
                 )
             task_stage = task_stage.clamp(0, self._num_log_std_stages - 1)
-            log_stds = torch.stack([head(x) for head in self.log_std_heads], dim=1)
-            return log_stds[torch.arange(x.shape[0], device=x.device), task_stage]
+            log_std = x.new_empty((x.shape[0], self.num_actions))
+            for stage_idx, head in enumerate(self.log_std_heads):
+                mask = task_stage == stage_idx
+                if mask.any():
+                    log_std[mask] = head(x[mask])
+            return log_std
         if self._state_dependent_log_std:
             return self.log_std_head(x)
         batch_size = x.shape[0]
@@ -419,7 +423,10 @@ class GaussianPolicy(torch.nn.Module):
         # old
         # return self._distribution.entropy().to(self.device)
         # new
-        return self._distribution.entropy().sum(dim=-1).unsqueeze(-1).to(self.device)
+        entropy = self._distribution.entropy().sum(dim=-1).unsqueeze(-1).to(self.device)
+
+        # print(f"summed entropy across actions: {entropy.shape}, {entropy.min()}, {entropy.max()}")
+        return entropy
 
     def distribution(self, role: str = "") -> torch.distributions.Normal:
         """Get the current action distribution.
