@@ -440,6 +440,62 @@ class GaussianPolicy(torch.nn.Module):
         return self._distribution
 
 
+class StageValuePreprocessor(nn.Module):
+    """One running value scaler per curriculum stage."""
+
+    def __init__(self, num_stages: int, device: Optional[Union[str, torch.device]] = None):
+        super().__init__()
+        if num_stages < 1:
+            raise ValueError("num_stages must be >= 1")
+        self.scalers = nn.ModuleList(
+            [RunningStandardScaler(size=1, device=device) for _ in range(num_stages)]
+        )
+        self.running_mean_mean = 0.0
+        self.running_variance_mean = 1.0
+
+    def _refresh_stats(self) -> None:
+        self.running_mean_mean = float(
+            np.mean([scaler.running_mean_mean for scaler in self.scalers])
+        )
+        self.running_variance_mean = float(
+            np.mean([scaler.running_variance_mean for scaler in self.scalers])
+        )
+
+    def forward(
+        self,
+        values: torch.Tensor,
+        train: bool = False,
+        inverse: bool = False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if task_stage is None:
+            raise ValueError("task_stage is required for stage-dependent value preprocessing")
+        if values.shape[-1] != 1:
+            raise ValueError(f"Expected scalar values with trailing dim 1, got {values.shape}")
+
+        original_shape = values.shape
+        flat_values = values.reshape(-1, values.shape[-1])
+        flat_stage = task_stage.reshape(-1).long().to(device=values.device)
+        if flat_stage.shape[0] != flat_values.shape[0]:
+            raise ValueError(
+                f"task_stage has {flat_stage.shape[0]} samples but values has {flat_values.shape[0]}"
+            )
+        flat_stage = flat_stage.clamp(0, len(self.scalers) - 1)
+
+        processed = flat_values.new_empty(flat_values.shape)
+        for stage_idx, scaler in enumerate(self.scalers):
+            mask = flat_stage == stage_idx
+            if mask.any():
+                stage_values = flat_values[mask]
+                # RunningStandardScaler uses unbiased variance; updating on one
+                # sample would produce NaNs, so keep existing stats in that case.
+                update_stats = train and stage_values.shape[0] > 1
+                processed[mask] = scaler(stage_values, train=update_stats, inverse=inverse)
+
+        self._refresh_stats()
+        return processed.reshape(original_shape)
+
+
 class DeterministicValue(torch.nn.Module):
     """Deterministic value function network.
     
@@ -451,7 +507,18 @@ class DeterministicValue(torch.nn.Module):
         action_space: Action space (unused, kept for API compatibility).
         device: Device to run computations on.
         hiddens: List of hidden layer sizes (default: [256, 128, 64]).
-        activations: List of activation function names (default: ["elu", "elu", "elu", "identity"]).
+        activations: List of activation function names. For the default single
+            value network this includes the final value activation. With
+            stage_dependent_value=True and shared_stage_value=True, this configures
+            only the shared value trunk.
+        stage_dependent_value: If True, select one value head/network per
+            curriculum stage using ``task_stage`` in :meth:`compute_value`.
+        shared_stage_value: If True, use a shared value trunk plus one head per
+            stage. If False, use one complete value network per stage.
+        num_value_stages: Number of stage-specific value heads/networks.
+        stage_value_hiddens: Hidden layer sizes for each stage-specific value head.
+        stage_value_activations: Activations for each stage-specific value head,
+            including the final value activation.
     """
 
     def __init__(
@@ -462,6 +529,12 @@ class DeterministicValue(torch.nn.Module):
         device: Optional[Union[str, torch.device]] = None,
         hiddens: list = [256, 128, 64],
         activations: list = ["elu", "elu", "elu", "identity"],
+        stage_dependent_value: bool = False,
+        shared_stage_value: bool = True,
+        num_value_stages: int = 1,
+        stage_value_hiddens: Optional[List[int]] = None,
+        stage_value_activations: Optional[List[str]] = None,
+        value_preprocessor_mode: str = "per_stage",
         scale_values: bool = True,
     ):
         super().__init__()
@@ -469,27 +542,136 @@ class DeterministicValue(torch.nn.Module):
         self.device = (
             torch.device("cuda:0" if torch.cuda.is_available() else "cpu") if device is None else torch.device(device)
         )
+        self._stage_dependent_value = stage_dependent_value
+        self._shared_stage_value = shared_stage_value
+        self._num_value_stages = num_value_stages
+        self._value_preprocessor_mode = value_preprocessor_mode
 
         hiddens = hiddens.copy()
-        hiddens.append(1)  # Output is scalar value
-        self.value_net = MLP(z_dim, hiddens, activations).to(device)
+        if stage_dependent_value:
+            if num_value_stages < 1:
+                raise ValueError("num_value_stages must be >= 1")
+            if shared_stage_value:
+                if stage_value_activations is None and len(activations) == len(hiddens) + 1:
+                    shared_activations = activations[:-1]
+                    stage_value_activations = [activations[-1]]
+                else:
+                    shared_activations = activations
+                stage_value_hiddens = [] if stage_value_hiddens is None else stage_value_hiddens.copy()
+                stage_value_activations = (
+                    ["identity"]
+                    if stage_value_activations is None
+                    else stage_value_activations.copy()
+                )
+                self.value_net = MLP(z_dim, hiddens, shared_activations).to(device)
+                value_output_dim = hiddens[-1] if hiddens else z_dim
+                self.value_heads = nn.ModuleList(
+                    [
+                        self._make_value_head(
+                            value_output_dim,
+                            stage_value_hiddens,
+                            stage_value_activations,
+                        ).to(device)
+                        for _ in range(num_value_stages)
+                    ]
+                )
+            else:
+                full_hiddens = hiddens.copy()
+                full_hiddens.append(1)
+                self.value_nets = nn.ModuleList(
+                    [MLP(z_dim, full_hiddens, activations).to(device) for _ in range(num_value_stages)]
+                )
+        else:
+            hiddens.append(1)  # Output is scalar value
+            self.value_net = MLP(z_dim, hiddens, activations).to(device)
 
-        # Initialize state preprocessor if specified
+        # Initialize value scaler(s) if specified.
+        # When stage-dependent value heads are enabled you can choose whether the
+        # running value normalization statistics are shared across stages or per-stage.
         if scale_values:
-            self.value_preprocessor = RunningStandardScaler(size=1, device=device)
+            if stage_dependent_value and value_preprocessor_mode not in ("per_stage", "shared"):
+                raise ValueError(
+                    f"value_preprocessor_mode must be 'per_stage' or 'shared', got '{value_preprocessor_mode}'"
+                )
+            if stage_dependent_value and value_preprocessor_mode == "per_stage":
+                self.value_preprocessor = StageValuePreprocessor(num_stages=num_value_stages, device=device)
+            else:
+                self.value_preprocessor = RunningStandardScaler(size=1, device=device)
         else:
             self.value_preprocessor = self.empty_preprocessor
 
-        # 1. Initialize hidden layers with standard gain (sqrt(2) for ReLU/Tanh)
-        self.value_net.apply(init_ppo_weights)
+        if stage_dependent_value and shared_stage_value:
+            self.value_net.apply(init_ppo_weights)
+            for head in self.value_heads:
+                self._init_value_net(head)
+        elif stage_dependent_value:
+            for value_net in self.value_nets:
+                self._init_value_net(value_net)
+        else:
+            self._init_value_net(self.value_net)
 
-        # 2. Overwrite the final layer to use a gain of 1.0 (for the Critic)
-        final_layer = list(self.value_net.modules())[-1] 
-        if isinstance(final_layer, nn.Linear):
-            nn.init.orthogonal_(final_layer.weight, gain=1.0)
-            nn.init.constant_(final_layer.bias, 0.0)
+    def _make_value_head(
+        self,
+        input_dim: int,
+        hiddens: List[int],
+        activations: List[str],
+    ) -> nn.Sequential:
+        """Build a stage-specific value head with optional private hidden layers."""
+        if len(activations) != len(hiddens) + 1:
+            raise ValueError(
+                "stage_value_activations must have one activation per hidden layer "
+                "plus one final value activation"
+            )
+        layers = []
+        if hiddens:
+            layers.extend(MLP(input_dim, hiddens, activations[:-1])._modules.values())
+            input_dim = hiddens[-1]
+        layers.append(nn.Linear(input_dim, 1))
+        layers.append(_ACTIVATIONS[activations[-1]])
+        return nn.Sequential(*layers)
 
-    def compute_value(self, z, inverse=False) -> torch.Tensor:
+    def _init_value_net(self, value_net: nn.Module) -> None:
+        """Initialize value hidden layers normally and the final value layer with gain 1."""
+        value_net.apply(init_ppo_weights)
+        linear_layers = [module for module in value_net.modules() if isinstance(module, nn.Linear)]
+        if linear_layers:
+            nn.init.orthogonal_(linear_layers[-1].weight, gain=1.0)
+            nn.init.constant_(linear_layers[-1].bias, 0.0)
+
+    def _value_from_features(
+        self, z: torch.Tensor, task_stage: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute raw value predictions, optionally selecting a stage-specific path."""
+        if self._stage_dependent_value:
+            if task_stage is None:
+                raise ValueError("task_stage is required when stage_dependent_value=True")
+            task_stage = task_stage.view(-1).long().to(device=z.device)
+            if task_stage.shape[0] != z.shape[0]:
+                raise ValueError(
+                    f"task_stage batch size {task_stage.shape[0]} != features batch size {z.shape[0]}"
+                )
+            task_stage = task_stage.clamp(0, self._num_value_stages - 1)
+            values = z.new_empty((z.shape[0], 1))
+            if self._shared_stage_value:
+                x = self.value_net(z)
+                for stage_idx, head in enumerate(self.value_heads):
+                    mask = task_stage == stage_idx
+                    if mask.any():
+                        values[mask] = head(x[mask])
+            else:
+                for stage_idx, value_net in enumerate(self.value_nets):
+                    mask = task_stage == stage_idx
+                    if mask.any():
+                        values[mask] = value_net(z[mask])
+            return values
+        return self.value_net(z)
+
+    def compute_value(
+        self,
+        z,
+        inverse=False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute value estimate from latent representation.
         
         Args:
@@ -498,10 +680,24 @@ class DeterministicValue(torch.nn.Module):
         Returns:
             Value estimates of shape (batch_size, 1).
         """
+        values = self._value_from_features(z, task_stage=task_stage)
         if inverse:
-            return self.value_preprocessor(self.value_net(z), inverse=True)
+            return self.preprocess_values(values, inverse=True, task_stage=task_stage)
         else:
-            return self.value_net(z)
+            return values
+
+    def preprocess_values(
+        self,
+        values: torch.Tensor,
+        train: bool = False,
+        inverse: bool = False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._stage_dependent_value and isinstance(self.value_preprocessor, StageValuePreprocessor):
+            return self.value_preprocessor(
+                values, train=train, inverse=inverse, task_stage=task_stage
+            )
+        return self.value_preprocessor(values, train=train, inverse=inverse)
 
     def empty_preprocessor(self, x, train=False, inverse=False):
         return x
@@ -525,8 +721,19 @@ class MultiCritic(torch.nn.Module):
         self.critics = torch.nn.ModuleList(critics)
         self.num_critics = len(critics)
         self.device = critics[0].device
+        self._stage_dependent_value = any(
+            getattr(critic, "_stage_dependent_value", False) for critic in critics
+        )
+        self._num_value_stages = max(
+            getattr(critic, "_num_value_stages", 1) for critic in critics
+        )
         
-    def compute_value(self, z, inverse=False) -> torch.Tensor:
+    def compute_value(
+        self,
+        z,
+        inverse=False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute value estimates from all critics.
         
         Args:
@@ -538,16 +745,42 @@ class MultiCritic(torch.nn.Module):
         """
         values = []
         for critic in self.critics:
-            value = critic.compute_value(z, inverse=inverse)  # Shape: (batch_size, 1)
+            value = critic.compute_value(
+                z, inverse=inverse, task_stage=task_stage
+            )  # Shape: (batch_size, 1)
             values.append(value)
         # Stack along last dimension: (batch_size, num_critics)
         return torch.cat(values, dim=-1)
 
-    def value_preprocessor(self, values, train=False, inverse=False):
+    def preprocess_values(
+        self,
+        values: torch.Tensor,
+        train: bool = False,
+        inverse: bool = False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         proccessed_values = []
         for i, critic in enumerate(self.critics):
-            proccessed_values.append(critic.value_preprocessor(values[:, :, i].unsqueeze(-1), train=train, inverse=inverse))
+            proccessed_values.append(
+                critic.preprocess_values(
+                    values[..., i].unsqueeze(-1),
+                    train=train,
+                    inverse=inverse,
+                    task_stage=task_stage,
+                )
+            )
         return torch.cat(proccessed_values, dim=-1)
+
+    def value_preprocessor(
+        self,
+        values: torch.Tensor,
+        train: bool = False,
+        inverse: bool = False,
+        task_stage: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.preprocess_values(
+            values, train=train, inverse=inverse, task_stage=task_stage
+        )
 
     def parameters(self):
         return itertools.chain(*[critic.parameters() for critic in self.critics])

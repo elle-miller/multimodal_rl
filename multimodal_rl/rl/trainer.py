@@ -543,6 +543,7 @@ class Trainer:
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
                 rewards = self._align_rewards_for_critics(rewards)
                 next_train_states, next_eval_states = self.split_train_eval_obs(next_states, self.num_eval_envs)
+                next_train_task_stage = self._get_train_task_stages()
 
                 # Render if not headless
                 if not self.headless:
@@ -558,6 +559,7 @@ class Trainer:
                     truncated[self.num_eval_envs :, :],
                     infos,
                     task_stage=train_task_stage,
+                    next_task_stage=next_train_task_stage,
                 )
         
                 # Update episode tracker
@@ -786,16 +788,18 @@ class Trainer:
             depth_color = depth_color.transpose(0, 3, 1, 2)  # [T, H, W, 3] -> [T, C, H, W]
             wandb.log({"depth_array": wandb.Video(depth_color, fps=10, format="mp4")}, step=self.global_step)
 
-    def _policy_requires_task_stage(self):
+    def _agent_requires_task_stage(self):
         policy = self.agent.policy
+        value = self.agent.value
         return bool(
             getattr(policy, "_stage_dependent_mean", False)
             or getattr(policy, "_stage_dependent_log_std", False)
+            or getattr(value, "_stage_dependent_value", False)
         )
 
     def _get_task_stages(self, start: int, end=None):
         """Current curriculum stage indices for a slice of envs (before env.step)."""
-        if not self._policy_requires_task_stage():
+        if not self._agent_requires_task_stage():
             return None
         env_unwrapped = getattr(self.env, "_unwrapped", self.env.env.unwrapped)
         if end is None:
@@ -821,6 +825,7 @@ class Trainer:
         truncated,
         infos,
         task_stage=None,
+        next_task_stage=None,
     ):
         """Save transition to memory buffers and update evaluation metrics.
         
@@ -862,6 +867,7 @@ class Trainer:
             truncated=truncated,
             timestep=self.global_step,
             task_stage=task_stage,
+            next_task_stage=next_task_stage,
         )
 
     def split_train_eval_obs(self, obs, n):

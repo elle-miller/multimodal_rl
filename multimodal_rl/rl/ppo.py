@@ -43,6 +43,8 @@ PPO_DEFAULT_CONFIG = {
     "multi_critic": None,  # Dict with keys: num_critics, gammas, weights, names. If None, single critic.
     "stage_dependent_mean": False,  # One mean head per curriculum stage
     "num_mean_stages": 1,
+    "stage_dependent_value": False,  # One value head/network per curriculum stage
+    "num_value_stages": 1,
     "state_dependent_log_std": False,  # If True, log_std is computed from state; if False, uses learnable parameter
     "stage_dependent_log_std": False,  # One log_std head per curriculum stage (requires state_dependent_log_std)
     "num_log_std_stages": 1,
@@ -172,7 +174,15 @@ class PPO:
             "stage_dependent_mean",
             getattr(policy, "_stage_dependent_mean", False),
         )
-        self._requires_task_stage = self._stage_dependent_log_std or self._stage_dependent_mean
+        self._stage_dependent_value = self.cfg.get(
+            "stage_dependent_value",
+            getattr(value, "_stage_dependent_value", False),
+        )
+        self._requires_task_stage = (
+            self._stage_dependent_log_std
+            or self._stage_dependent_mean
+            or self._stage_dependent_value
+        )
 
         # Networks
         self.policy = policy
@@ -323,6 +333,7 @@ class PPO:
             self._minibatch_size = 7 + (1 if self._requires_task_stage else 0)
 
         self._current_next_states = None
+        self._current_next_task_stage = None
         self._active_mask = None
 
 
@@ -337,6 +348,7 @@ class PPO:
         truncated: torch.Tensor,
         timestep: int,
         task_stage: Optional[torch.Tensor] = None,
+        next_task_stage: Optional[torch.Tensor] = None,
     ) -> None:
         """Record an environment transition in memory.
         
@@ -358,6 +370,7 @@ class PPO:
             return
 
         self._current_next_states = next_states
+        self._current_next_task_stage = next_task_stage if next_task_stage is not None else task_stage
 
         # Ensure rewards have correct shape
         if rewards.dim() == 1:
@@ -373,7 +386,9 @@ class PPO:
         # Compute value estimates (no gradients needed during rollout collection)
         with torch.no_grad():
             z = self.encoder(states)
-            values = self.value.compute_value(z, inverse=True)
+            values = self.value.compute_value(
+                z, inverse=True, task_stage=task_stage
+            )
 
         # Time-limit bootstrapping: add discounted value to reward at truncation
         if self._time_limit_bootstrap:
@@ -397,7 +412,7 @@ class PPO:
         )
         if self._requires_task_stage:
             if task_stage is None:
-                raise ValueError("task_stage is required for stage-dependent policy heads")
+                raise ValueError("task_stage is required for stage-dependent policy/value heads")
             transition["task_stage"] = task_stage.view(-1, 1).to(dtype=torch.int64)
         self.memory.add_samples(**transition)
 
@@ -456,7 +471,9 @@ class PPO:
         with torch.no_grad():
             self.value.eval()
             z = self.encoder(self._current_next_states)
-            last_values = self.value.compute_value(z, inverse=True)          
+            last_values = self.value.compute_value(
+                z, inverse=True, task_stage=self._current_next_task_stage
+            )
             self.value.train()
 
         # Get stored values and compute GAE - size (rollout, num_envs, num_critics)
@@ -507,9 +524,19 @@ class PPO:
                 lambda_coefficient=self._lambda,
             )
 
-        # Preprocess values and returns for training
-        processed_values = self.value.value_preprocessor(values, train=True)
-        processed_returns = self.value.value_preprocessor(returns, train=True)
+        # Preprocess values and returns for training. Stage-dependent critics
+        # keep separate running statistics per active stage.
+        value_task_stage = (
+            self.memory.get_tensor_by_name("task_stage")
+            if self._stage_dependent_value
+            else None
+        )
+        processed_values = self.value.preprocess_values(
+            values, train=True, task_stage=value_task_stage
+        )
+        processed_returns = self.value.preprocess_values(
+            returns, train=True, task_stage=value_task_stage
+        )
         self.memory.set_tensor_by_name("values", processed_values)
         self.memory.set_tensor_by_name("returns", processed_returns)
         self.memory.set_tensor_by_name("advantages", advantages)
@@ -624,7 +651,9 @@ class PPO:
                 # Value path: compute value predictions
                 z_value = self.encoder(sampled_states)
                 z_value.requires_grad_(True)
-                predicted_values = self.value.compute_value(z_value)
+                predicted_values = self.value.compute_value(
+                    z_value, task_stage=sampled_task_stage
+                )
                 if self._value_clip > 0:
                     predicted_values = sampled_values + torch.clamp(
                         predicted_values - sampled_values,
